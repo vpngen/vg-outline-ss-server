@@ -15,8 +15,8 @@ vendor: "VPNGen"
 homepage: "http://vpngen.org"
 
 contents:
-- src: bin/ss-server
-  dst: /usr/sbin/ss-server
+- src: bin/outline-ss-server
+  dst: /usr/sbin/outline-ss-server
   file_info:
     mode: 0555
     owner: root
