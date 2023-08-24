@@ -1,0 +1,7 @@
+*~
+*.swp
+*.log
+vendor
+dist
+.new
+.legacy

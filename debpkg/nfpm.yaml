@@ -1,0 +1,26 @@
+name: "vg-outline-ss-server"
+arch: "all"
+platform: "linux"
+version: ${PACKAGE_VERSION}
+section: "default"
+priority: "optional"
+release: ${PACKAGE_RELEASE}
+
+provides:
+- vg-outline-ss-server
+
+maintainer: "Ingmund Ollson <ingmund@proton.me>"
+description: VPNGen Outline Shadowsocks server
+vendor: "VPNGen"
+homepage: "http://vpngen.org"
+
+contents:
+- src: bin/ss-server
+  dst: /usr/sbin/ss-server
+  file_info:
+    mode: 0555
+    owner: root
+    group: root
+
+deb:
+  compression: xz
