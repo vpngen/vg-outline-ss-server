@@ -1,0 +1,312 @@
+diff --git a/cmd/outline-ss-server/config_example.yml b/cmd/outline-ss-server/config_example.yml
+index aa4c56c..603b042 100644
+--- a/cmd/outline-ss-server/config_example.yml
++++ b/cmd/outline-ss-server/config_example.yml
+@@ -6,6 +6,10 @@ keys:
+     secret: Secret0
+     recv_limit: 128000
+     send_limit: 128000
++    allowed_lan:
++      - 192.168.123.0/16
++      - fd12:3456::/64
++      - 127.0.0.0/24
+ 
+   - id: user-1
+     port: 9000
+diff --git a/cmd/outline-ss-server/main.go b/cmd/outline-ss-server/main.go
+index b1d3a60..7cadb9c 100644
+--- a/cmd/outline-ss-server/main.go
++++ b/cmd/outline-ss-server/main.go
+@@ -29,6 +29,7 @@ import (
+ 	"github.com/Jigsaw-Code/outline-sdk/transport"
+ 	"github.com/Jigsaw-Code/outline-sdk/transport/shadowsocks"
+ 	"github.com/Jigsaw-Code/outline-ss-server/ipinfo"
++	onet "github.com/Jigsaw-Code/outline-ss-server/net"
+ 	"github.com/Jigsaw-Code/outline-ss-server/service"
+ 	"github.com/op/go-logging"
+ 	"github.com/prometheus/client_golang/prometheus"
+@@ -145,12 +146,16 @@ func (s *SSServer) loadConfig(filename string, bindAddrForOverwrite string) erro
+ 			cipherList = list.New()
+ 			portCiphers[keyConfig.Port] = cipherList
+ 		}
++		allowedPrivateNets, err := onet.NewAllowedLAN(keyConfig.AllowedLAN)
++		if err != nil {
++			return fmt.Errorf("failed to parse allowed LAN for key %v: %w", keyConfig.ID, err)
++		}
+ 		cryptoKey, err := shadowsocks.NewEncryptionKey(keyConfig.Cipher, keyConfig.Secret)
+ 		if err != nil {
+ 			return fmt.Errorf("failed to create encyption key for key %v: %w", keyConfig.ID, err)
+ 		}
+ 		entry := service.MakeCipherEntry(keyConfig.ID, cryptoKey, keyConfig.Secret,
+-			service.NewTrafficLimiter(keyConfig.RecvLimit, keyConfig.SendLimit))
++			service.NewTrafficLimiter(keyConfig.RecvLimit, keyConfig.SendLimit), allowedPrivateNets)
+ 		cipherList.PushBack(&entry)
+ 	}
+ 	for port := range s.ports {
+@@ -215,12 +220,13 @@ func RunSSServer(filename string, natTimeout time.Duration, sm *outlineMetrics,
+ type Config struct {
+ 	BindAddress string `yaml:"bind_address"`
+ 	Keys        []struct {
+-		ID        string `yaml:"id"`
+-		Port      int    `yaml:"port"`
+-		Cipher    string `yaml:"cipher"`
+-		Secret    string `yaml:"secret"`
+-		RecvLimit int    `yaml:"recv_limit"`
+-		SendLimit int    `yaml:"send_limit"`
++		ID         string   `yaml:"id"`
++		Port       int      `yaml:"port"`
++		Cipher     string   `yaml:"cipher"`
++		Secret     string   `yaml:"secret"`
++		RecvLimit  int      `yaml:"recv_limit"`
++		SendLimit  int      `yaml:"send_limit"`
++		AllowedLAN []string `yaml:"allowed_lan"`
+ 	} `yaml:"keys"`
+ }
+ 
+diff --git a/net/allowed_lan.go b/net/allowed_lan.go
+new file mode 100644
+index 0000000..f5ffc30
+--- /dev/null
++++ b/net/allowed_lan.go
+@@ -0,0 +1,46 @@
++// Copyright 2018 Jigsaw Operations LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package net
++
++import (
++	"fmt"
++	"net"
++)
++
++func NewAllowedLAN(list []string) ([]*net.IPNet, error) {
++	var allowedLAN []*net.IPNet
++
++	for _, cidr := range list {
++		_, network, err := net.ParseCIDR(cidr)
++		if err != nil {
++			return nil, fmt.Errorf("invalid cidr: %w", err)
++		}
++
++		allowedLAN = append(allowedLAN, network)
++	}
++
++	return allowedLAN, nil
++}
++
++// IsPrivateAddressAllowed - returns whether an destinatio IP address
++// belongs to the allowed private networks.
++func IsPrivateAddressAllowed(allowedLAN []*net.IPNet, ip net.IP) bool {
++	for _, network := range allowedLAN {
++		if network.Contains(ip) {
++			return true
++		}
++	}
++	return false
++}
+diff --git a/service/cipher_list.go b/service/cipher_list.go
+index 3794303..babcb9d 100644
+--- a/service/cipher_list.go
++++ b/service/cipher_list.go
+@@ -32,11 +32,12 @@ type CipherEntry struct {
+ 	CryptoKey      *shadowsocks.EncryptionKey
+ 	SaltGenerator  ServerSaltGenerator
+ 	TrafficLimiter TrafficLimiter
++	AllowedLAN     []*net.IPNet
+ 	lastClientIP   net.IP
+ }
+ 
+ // MakeCipherEntry constructs a CipherEntry.
+-func MakeCipherEntry(id string, cryptoKey *shadowsocks.EncryptionKey, secret string, limiter TrafficLimiter) CipherEntry {
++func MakeCipherEntry(id string, cryptoKey *shadowsocks.EncryptionKey, secret string, limiter TrafficLimiter, networks []*net.IPNet) CipherEntry {
+ 	var saltGenerator ServerSaltGenerator
+ 	if cryptoKey.SaltSize()-serverSaltMarkLen >= minSaltEntropy {
+ 		// Mark salts with a tag for reverse replay protection.
+@@ -51,6 +52,7 @@ func MakeCipherEntry(id string, cryptoKey *shadowsocks.EncryptionKey, secret str
+ 		CryptoKey:      cryptoKey,
+ 		SaltGenerator:  saltGenerator,
+ 		TrafficLimiter: limiter,
++		AllowedLAN:     networks,
+ 	}
+ }
+ 
+diff --git a/service/cipher_list_testing.go b/service/cipher_list_testing.go
+index dcba9b2..dd16891 100644
+--- a/service/cipher_list_testing.go
++++ b/service/cipher_list_testing.go
+@@ -17,6 +17,7 @@ package service
+ import (
+ 	"container/list"
+ 	"fmt"
++	"net"
+ 
+ 	"github.com/Jigsaw-Code/outline-sdk/transport/shadowsocks"
+ )
+@@ -31,7 +32,7 @@ func MakeTestCiphers(secrets []string, rx, tx int) (CipherList, error) {
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to create cipher %v: %w", i, err)
+ 		}
+-		entry := MakeCipherEntry(cipherID, cipher, secrets[i], NewTrafficLimiter(rx, tx))
++		entry := MakeCipherEntry(cipherID, cipher, secrets[i], NewTrafficLimiter(rx, tx), []*net.IPNet{})
+ 		l.PushBack(&entry)
+ 	}
+ 	cipherList := NewCipherList()
+diff --git a/service/tcp.go b/service/tcp.go
+index 46b5259..c64ddba 100644
+--- a/service/tcp.go
++++ b/service/tcp.go
+@@ -289,7 +289,12 @@ func (h *tcpHandler) handleConnection(listenerPort int, clientConn transport.Str
+ 		return id, onet.NewConnectionError("ERR_READ_ADDRESS", "Failed to get target address", err)
+ 	}
+ 	logger.Debugf("address %s", clientConn.RemoteAddr().String())
+-	tgtConn, dialErr := dialTarget(tgtAddr, proxyMetrics, h.targetIPValidator)
++	tgtConn, dialErr := dialTarget(tgtAddr, proxyMetrics, func(ip net.IP) *onet.ConnectionError {
++		if onet.IsPrivateAddressAllowed(cipherEntry.AllowedLAN, ip) {
++			return nil
++		}
++		return h.targetIPValidator(ip)
++	})
+ 	if dialErr != nil {
+ 		// We don't drain so dial errors and invalid addresses are communicated quickly.
+ 		return id, dialErr
+diff --git a/service/udp.go b/service/udp.go
+index c2bd9a1..c5ca0f7 100644
+--- a/service/udp.go
++++ b/service/udp.go
+@@ -64,13 +64,14 @@ func debugUDPAddr(addr net.Addr, template string, val interface{}) {
+ 
+ // Decrypts src into dst. It tries each cipher until it finds one that authenticates
+ // correctly. dst and src must not overlap.
+-func findAccessKeyUDP(clientIP net.IP, dst, src []byte, cipherList CipherList) ([]byte, string, *shadowsocks.EncryptionKey, TrafficLimiter, error) {
++func findAccessKeyUDP(clientIP net.IP, dst, src []byte, cipherList CipherList) ([]byte, string, *shadowsocks.EncryptionKey, TrafficLimiter, []*net.IPNet, error) {
+ 	// Try each cipher until we find one that authenticates successfully. This assumes that all ciphers are AEAD.
+ 	// We snapshot the list because it may be modified while we use it.
+ 	snapshot := cipherList.SnapshotForClientIP(clientIP)
+ 	for ci, entry := range snapshot {
+ 		id, cryptoKey := entry.Value.(*CipherEntry).ID, entry.Value.(*CipherEntry).CryptoKey
+ 		limiter := entry.Value.(*CipherEntry).TrafficLimiter
++		networks := entry.Value.(*CipherEntry).AllowedLAN
+ 		buf, err := shadowsocks.Unpack(dst, src, cryptoKey)
+ 		if err != nil {
+ 			debugUDP(id, "Failed to unpack: %v", err)
+@@ -79,9 +80,9 @@ func findAccessKeyUDP(clientIP net.IP, dst, src []byte, cipherList CipherList) (
+ 		debugUDP(id, "Found cipher at index %d", ci)
+ 		// Move the active cipher to the front, so that the search is quicker next time.
+ 		cipherList.MarkUsedByClientIP(entry, clientIP)
+-		return buf, id, cryptoKey, limiter, nil
++		return buf, id, cryptoKey, limiter, networks, nil
+ 	}
+-	return nil, "", nil, nil, errors.New("could not find valid cipher")
++	return nil, "", nil, nil, nil, errors.New("could not find valid cipher")
+ }
+ 
+ type packetHandler struct {
+@@ -154,6 +155,7 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
+ 			cipherData := cipherBuf[:clientProxyBytes]
+ 			var payload []byte
+ 			var tgtUDPAddr *net.UDPAddr
++			var allowedLAN []*net.IPNet
+ 			targetConn := nm.Get(clientAddr.String())
+ 			if targetConn == nil {
+ 				var locErr error
+@@ -167,7 +169,7 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
+ 				var textData []byte
+ 				var cryptoKey *shadowsocks.EncryptionKey
+ 				unpackStart := time.Now()
+-				textData, keyID, cryptoKey, limiter, err = findAccessKeyUDP(ip, textBuf, cipherData, h.ciphers)
++				textData, keyID, cryptoKey, limiter, allowedLAN, err = findAccessKeyUDP(ip, textBuf, cipherData, h.ciphers)
+ 				timeToCipher := time.Since(unpackStart)
+ 				h.m.AddUDPCipherSearch(err == nil, timeToCipher)
+ 
+@@ -176,7 +178,7 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
+ 				}
+ 
+ 				var onetErr *onet.ConnectionError
+-				if payload, tgtUDPAddr, onetErr = h.validatePacket(textData); onetErr != nil {
++				if payload, tgtUDPAddr, onetErr = h.validatePacket(textData, allowedLAN); onetErr != nil {
+ 					return onetErr
+ 				}
+ 
+@@ -200,9 +202,10 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
+ 				// The key ID is known with confidence once decryption succeeds.
+ 				keyID = targetConn.keyID
+ 				limiter = targetConn.limiter
++				allowedLAN = targetConn.allowedLAN
+ 
+ 				var onetErr *onet.ConnectionError
+-				if payload, tgtUDPAddr, onetErr = h.validatePacket(textData); onetErr != nil {
++				if payload, tgtUDPAddr, onetErr = h.validatePacket(textData, allowedLAN); onetErr != nil {
+ 					return onetErr
+ 				}
+ 			}
+@@ -232,7 +235,8 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
+ // Given the decrypted contents of a UDP packet, return
+ // the payload and the destination address, or an error if
+ // this packet cannot or should not be forwarded.
+-func (h *packetHandler) validatePacket(textData []byte) ([]byte, *net.UDPAddr, *onet.ConnectionError) {
++// networks - is dirty hack to allow per user access to private networks.
++func (h *packetHandler) validatePacket(textData []byte, networks []*net.IPNet) ([]byte, *net.UDPAddr, *onet.ConnectionError) {
+ 	tgtAddr := socks.SplitAddr(textData)
+ 	if tgtAddr == nil {
+ 		return nil, nil, onet.NewConnectionError("ERR_READ_ADDRESS", "Failed to get target address", nil)
+@@ -242,7 +246,12 @@ func (h *packetHandler) validatePacket(textData []byte) ([]byte, *net.UDPAddr, *
+ 	if err != nil {
+ 		return nil, nil, onet.NewConnectionError("ERR_RESOLVE_ADDRESS", fmt.Sprintf("Failed to resolve target address %v", tgtAddr), err)
+ 	}
+-	if err := h.targetIPValidator(tgtUDPAddr.IP); err != nil {
++	if err := func() *onet.ConnectionError {
++		if onet.IsPrivateAddressAllowed(networks, tgtUDPAddr.IP) {
++			return nil
++		}
++		return h.targetIPValidator(tgtUDPAddr.IP)
++	}(); err != nil {
+ 		return nil, nil, err
+ 	}
+ 
+@@ -257,9 +266,10 @@ func isDNS(addr net.Addr) bool {
+ 
+ type natconn struct {
+ 	net.PacketConn
+-	cryptoKey *shadowsocks.EncryptionKey
+-	keyID     string
+-	limiter   TrafficLimiter
++	cryptoKey  *shadowsocks.EncryptionKey
++	keyID      string
++	limiter    TrafficLimiter
++	allowedLAN []*net.IPNet
+ 	// We store the client information in the NAT map to avoid recomputing it
+ 	// for every downstream packet in a UDP-based connection.
+ 	clientInfo ipinfo.IPInfo
+diff --git a/service/udp_test.go b/service/udp_test.go
+index 236554a..e4d53cb 100644
+--- a/service/udp_test.go
++++ b/service/udp_test.go
+@@ -447,7 +447,7 @@ func BenchmarkUDPUnpackRepeat(b *testing.B) {
+ 		cipherNumber := n % numCiphers
+ 		ip := ips[cipherNumber]
+ 		packet := packets[cipherNumber]
+-		_, _, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
++		_, _, _, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
+ 		if err != nil {
+ 			b.Error(err)
+ 		}
+@@ -476,7 +476,7 @@ func BenchmarkUDPUnpackSharedKey(b *testing.B) {
+ 	b.ResetTimer()
+ 	for n := 0; n < b.N; n++ {
+ 		ip := ips[n%numIPs]
+-		_, _, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
++		_, _, _, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
+ 		if err != nil {
+ 			b.Error(err)
+ 		}
