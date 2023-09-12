@@ -96,6 +96,8 @@ if [ "$1" = "pkg" ]; then
         #git -C Cloak apply /data/src/internal-server-usermanager-api_router.go.patch        
         git -C outline-ss-server apply /data/src/outeline-ss-server-limiter.patch
         git -C outline-ss-server apply /data/src/outeline-ss-server-allowed-lan.patch
+        git -C outline-ss-server apply /data/src/outeline-ss-server-bittorrent-filter.patch
+        git -C outline-ss-server apply /data/src/outeline-ss-server-allow-self.patch
 
         go build -C outline-ss-server/cmd/outline-ss-server -o ../../../bin/outline-ss-server
 
