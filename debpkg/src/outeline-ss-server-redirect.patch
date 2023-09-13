@@ -562,7 +562,7 @@ index a48a800..17b0459 100644
  		// We don't drain so dial errors and invalid addresses are communicated quickly.
  		return id, dialErr
 diff --git a/service/udp.go b/service/udp.go
-index b71fce5..95b6f4d 100644
+index b71fce5..902694b 100644
 --- a/service/udp.go
 +++ b/service/udp.go
 @@ -65,7 +65,7 @@ func debugUDPAddr(addr net.Addr, template string, val interface{}) {
@@ -634,16 +634,18 @@ index b71fce5..95b6f4d 100644
  	// We store the client information in the NAT map to avoid recomputing it
  	// for every downstream packet in a UDP-based connection.
  	clientInfo ipinfo.IPInfo
-@@ -314,7 +317,8 @@ func (c *natconn) onRead(addr net.Addr) {
+@@ -314,8 +317,9 @@ func (c *natconn) onRead(addr net.Addr) {
  }
  
  func (c *natconn) WriteTo(buf []byte, dst net.Addr) (int, error) {
 -	c.onWrite(dst)
+-	return c.PacketConn.WriteTo(buf, dst)
 +	actualDst := c.redirecter.RedirectUDP(dst)
 +	c.onWrite(actualDst)
- 	return c.PacketConn.WriteTo(buf, dst)
++	return c.PacketConn.WriteTo(buf, actualDst)
  }
  
+ func (c *natconn) ReadFrom(buf []byte) (int, net.Addr, error) {
 @@ -349,13 +353,14 @@ func (m *natmap) Get(key string) *natconn {
  }
  
