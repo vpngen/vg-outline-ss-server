@@ -17,10 +17,29 @@ index c3e7286..3d2203c 100644
      send_limit: 128000
      allowed_lan:
 diff --git a/cmd/outline-ss-server/main.go b/cmd/outline-ss-server/main.go
-index 8d532c0..1915e82 100644
+index 8d532c0..9f39ebc 100644
 --- a/cmd/outline-ss-server/main.go
 +++ b/cmd/outline-ss-server/main.go
-@@ -140,6 +140,18 @@ func (s *SSServer) loadConfig(filename string, bindAddrForOverwrite string) erro
+@@ -125,8 +125,16 @@ func (s *SSServer) removePort(portNum int) error {
+ 	return nil
+ }
+ 
+-// ErrInvalidPortNumber is returned when a port number is not in the range 1-65535.
+-var ErrInvalidPortNumber = fmt.Errorf("invalid port number")
++var (
++	// ErrInvalidPortNumber is returned when a port number is not in the range 1-65535.
++	ErrInvalidPortNumber = fmt.Errorf("invalid port number")
++
++	// ErrInvalidSelfPolicy is returned when the self_policy is not "allow" or "deny".
++	ErrInvalidSelfPolicy = fmt.Errorf("invalid self_policy")
++
++	// ErrInvalidAllowSelfValue is returned when the allow_self value is not "true" or "false" or not set.
++	ErrInvalidAllowSelfValue = fmt.Errorf("invalid allow_self value")
++)
+ 
+ func (s *SSServer) loadConfig(filename string, bindAddrForOverwrite string) error {
+ 	config, err := readConfig(filename)
+@@ -140,6 +148,26 @@ func (s *SSServer) loadConfig(filename string, bindAddrForOverwrite string) erro
  		bindAddr = bindAddrForOverwrite
  	}
  
@@ -31,29 +50,45 @@ index 8d532c0..1915e82 100644
 +		switch config.SelfPolicy {
 +		case "allow":
 +			selfPolicy = 1
++			logger.Infof("Allowing self access to all keys to %v", ip)
 +		case "deny":
 +			selfPolicy = -1
++			logger.Infof("Denying self access to all keys to %v", ip)
++		default:
++			return fmt.Errorf("%w: %v", ErrInvalidSelfPolicy, config.SelfPolicy)
 +		}
++	}
++
++	if selfPolicy == 0 {
++		logger.Info("Self access to keys is not restricted")
 +	}
 +
  	bitFilter := &service.BitTorrentFilter{}
  	if config.BitTorrentFilter.BlockDuration > 0 {
  		logger.Infof("Bittorrent filter enabled with block duration %v seconds", config.BitTorrentFilter.BlockDuration)
-@@ -175,8 +187,21 @@ func (s *SSServer) loadConfig(filename string, bindAddrForOverwrite string) erro
+@@ -175,8 +203,29 @@ func (s *SSServer) loadConfig(filename string, bindAddrForOverwrite string) erro
  		if err != nil {
  			return fmt.Errorf("failed to create encyption key for key %v: %w", keyConfig.ID, err)
  		}
 +		denySelf := (net.IP)(nil)
 +		switch selfPolicy {
 +		case -1: // deny all except
-+			if keyConfig.AllowSelf != "true" {
++			switch keyConfig.AllowSelf {
++			case "false", "":
 +				denySelf = ip
-+				// logger.Debugf("Denying self access to key %v to %v", keyConfig.ID, ip)
++			case "true":
++				logger.Debugf("Allowing self access to key %v to %v", keyConfig.ID, ip)
++			default:
++				return fmt.Errorf("%w for key %v: %v", ErrInvalidAllowSelfValue, keyConfig.ID, keyConfig.AllowSelf)
 +			}
 +		case 1: // allow all except
-+			if keyConfig.AllowSelf == "false" {
++			switch keyConfig.AllowSelf {
++			case "false":
 +				denySelf = ip
-+				// logger.Debugf("Denying self access to key %v to %v", keyConfig.ID, ip)
++				logger.Debugf("Denying self access to key %v to %v", keyConfig.ID, ip)
++			case "true", "":
++			default:
++				return fmt.Errorf("%w for key %v: %v", ErrInvalidAllowSelfValue, keyConfig.ID, keyConfig.AllowSelf)
 +			}
 +		}
  		entry := service.MakeCipherEntry(keyConfig.ID, cryptoKey, keyConfig.Secret,
@@ -62,7 +97,7 @@ index 8d532c0..1915e82 100644
  		cipherList.PushBack(&entry)
  	}
  	for port := range s.ports {
-@@ -250,6 +275,7 @@ type BitTorrentFilter struct {
+@@ -250,6 +299,7 @@ type BitTorrentFilter struct {
  
  type Config struct {
  	BindAddress      string           `yaml:"bind_address"`
@@ -70,7 +105,7 @@ index 8d532c0..1915e82 100644
  	BitTorrentFilter BitTorrentFilter `yaml:"bittorrent_filter"`
  	Keys             []struct {
  		ID         string   `yaml:"id"`
-@@ -259,6 +285,7 @@ type Config struct {
+@@ -259,6 +309,7 @@ type Config struct {
  		RecvLimit  int      `yaml:"recv_limit"`
  		SendLimit  int      `yaml:"send_limit"`
  		AllowedLAN []string `yaml:"allowed_lan"`
