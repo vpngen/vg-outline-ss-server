@@ -1,0 +1,706 @@
+diff --git a/cmd/outline-ss-server/config_example.yml b/cmd/outline-ss-server/config_example.yml
+index 1174509..9cafb1e 100644
+--- a/cmd/outline-ss-server/config_example.yml
++++ b/cmd/outline-ss-server/config_example.yml
+@@ -14,6 +14,12 @@ keys:
+     secret: Secret0
+     recv_limit: 128000
+     send_limit: 128000
++    redirect:
++      udp:
++        - "1.1.1.1:53 to 8.8.8.8:53"
++      tcp:
++        - "1.1.1.1:53 to 8.8.8.8:53"
++        - "93.184.216.34 to 1.1.1.1"
+ 
+   - id: user-1
+     port: 9000
+diff --git a/cmd/outline-ss-server/main.go b/cmd/outline-ss-server/main.go
+index ae02e4b..387fb01 100644
+--- a/cmd/outline-ss-server/main.go
++++ b/cmd/outline-ss-server/main.go
+@@ -170,8 +170,18 @@ func (s *SSServer) loadConfig(filename string, bindAddrForOverwrite string) erro
+ 		if err != nil {
+ 			return fmt.Errorf("failed to create encyption key for key %v: %w", keyConfig.ID, err)
+ 		}
++		rdr, err := service.NewRedirectTable(&keyConfig.Redirect)
++		if err != nil {
++			return fmt.Errorf("failed to create redirect table for key %v: %w", keyConfig.ID, err)
++		}
++		if len(keyConfig.Redirect.TCP) > 0 {
++			logger.Infof("Load %d tcp redirect rules for key %v", len(keyConfig.Redirect.TCP), keyConfig.ID)
++		}
++		if len(keyConfig.Redirect.UDP) > 0 {
++			logger.Infof("Load %d udp redirect rules for key %v", len(keyConfig.Redirect.UDP), keyConfig.ID)
++		}
+ 		entry := service.MakeCipherEntry(keyConfig.ID, cryptoKey, keyConfig.Secret,
+-			service.NewTrafficLimiter(keyConfig.RecvLimit, keyConfig.SendLimit))
++			service.NewTrafficLimiter(keyConfig.RecvLimit, keyConfig.SendLimit), rdr)
+ 		cipherList.PushBack(&entry)
+ 	}
+ 	for port := range s.ports {
+@@ -247,12 +257,13 @@ type Config struct {
+ 	BindAddress      string           `yaml:"bind_address"`
+ 	BitTorrentFilter BitTorrentFilter `yaml:"bittorrent_filter"`
+ 	Keys             []struct {
+-		ID        string `yaml:"id"`
+-		Port      int    `yaml:"port"`
+-		Cipher    string `yaml:"cipher"`
+-		Secret    string `yaml:"secret"`
+-		RecvLimit int    `yaml:"recv_limit"`
+-		SendLimit int    `yaml:"send_limit"`
++		ID        string                 `yaml:"id"`
++		Port      int                    `yaml:"port"`
++		Cipher    string                 `yaml:"cipher"`
++		Secret    string                 `yaml:"secret"`
++		RecvLimit int                    `yaml:"recv_limit"`
++		SendLimit int                    `yaml:"send_limit"`
++		Redirect  service.RedirectConfig `yaml:"redirect"`
+ 	} `yaml:"keys"`
+ }
+ 
+diff --git a/service/cipher_list.go b/service/cipher_list.go
+index b0de9e8..c834e2c 100644
+--- a/service/cipher_list.go
++++ b/service/cipher_list.go
+@@ -33,12 +33,13 @@ type CipherEntry struct {
+ 	CryptoKey      *shadowsocks.EncryptionKey
+ 	SaltGenerator  ServerSaltGenerator
+ 	TrafficLimiter TrafficLimiter
++	Redirect       Redirecter
+ 	lastClientIP   net.IP
+ 	BitBanned      atomic.Int64
+ }
+ 
+ // MakeCipherEntry constructs a CipherEntry.
+-func MakeCipherEntry(id string, cryptoKey *shadowsocks.EncryptionKey, secret string, limiter TrafficLimiter) CipherEntry {
++func MakeCipherEntry(id string, cryptoKey *shadowsocks.EncryptionKey, secret string, limiter TrafficLimiter, rdr Redirecter) CipherEntry {
+ 	var saltGenerator ServerSaltGenerator
+ 	if cryptoKey.SaltSize()-serverSaltMarkLen >= minSaltEntropy {
+ 		// Mark salts with a tag for reverse replay protection.
+@@ -53,6 +54,7 @@ func MakeCipherEntry(id string, cryptoKey *shadowsocks.EncryptionKey, secret str
+ 		CryptoKey:      cryptoKey,
+ 		SaltGenerator:  saltGenerator,
+ 		TrafficLimiter: limiter,
++		Redirect:       rdr,
+ 	}
+ }
+ 
+diff --git a/service/cipher_list_testing.go b/service/cipher_list_testing.go
+index b4b8a6c..26ccc73 100644
+--- a/service/cipher_list_testing.go
++++ b/service/cipher_list_testing.go
+@@ -31,7 +31,8 @@ func MakeTestCiphers(secrets []string, rx, tx int) (CipherList, error) {
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to create cipher %v: %w", i, err)
+ 		}
+-		entry := MakeCipherEntry(cipherID, cipher, secrets[i], NewTrafficLimiter(rx, tx))
++		rdr, _ := NewRedirectTable(nil)
++		entry := MakeCipherEntry(cipherID, cipher, secrets[i], NewTrafficLimiter(rx, tx), rdr)
+ 		l.PushBack(&entry)
+ 	}
+ 	cipherList := NewCipherList()
+diff --git a/service/redirect.go b/service/redirect.go
+new file mode 100644
+index 0000000..9a760d5
+--- /dev/null
++++ b/service/redirect.go
+@@ -0,0 +1,274 @@
++package service
++
++import (
++	"fmt"
++	"net"
++	"strconv"
++	"strings"
++
++	"github.com/shadowsocks/go-shadowsocks2/socks"
++)
++
++type RedirectConfig struct {
++	UDP []string `yaml:"udp"`
++	TCP []string `yaml:"tcp"`
++}
++
++type (
++	rdrTCPPortTable map[string]socks.Addr
++	rdrTCPTable     map[string]rdrTCPPortTable
++
++	rdrUDPPortTable map[string]*net.UDPAddr
++	rdrUDPTable     map[string]rdrUDPPortTable
++)
++
++var (
++	// ErrSplitRedirectRule is returned when the redirect rule is invalid.
++	ErrSplitRedirectRule = fmt.Errorf("can't split")
++
++	// ErrParseIP is returned when the IP address is invalid.
++	ErrParseIP = fmt.Errorf("invalid ip address")
++
++	// ErrParseAddr is returned when the host:port is invalid.
++	ErrParseAddr = fmt.Errorf("invalid host:port")
++)
++
++const rdrMagicPort = "0"
++
++func (t rdrTCPTable) add(rule string) error {
++	from, to, ok := strings.Cut(rule, " to ")
++	if !ok {
++		return fmt.Errorf("invalid redirect rule: %s: %w", rule, ErrSplitRedirectRule)
++	}
++
++	fromIP, fromPort, err := net.SplitHostPort(from)
++	if err != nil {
++		ip := net.ParseIP(from)
++		if ip == nil || ip.IsUnspecified() {
++			return fmt.Errorf("invalid redirect rule: %s: from ip: %w", rule, ErrParseIP)
++		}
++
++		fromIP = ip.String()
++		fromPort = rdrMagicPort
++	}
++
++	toIP, toPort, err := net.SplitHostPort(to)
++	if err != nil {
++		ip := net.ParseIP(to)
++		if ip == nil || ip.IsUnspecified() {
++			return fmt.Errorf("invalid redirect rule: %s: to ip: %w", rule, ErrParseIP)
++		}
++
++		toIP = ip.String()
++		toPort = rdrMagicPort
++	}
++
++	targ := socks.ParseAddr(net.JoinHostPort(toIP, toPort))
++	if targ == nil {
++		return fmt.Errorf("invalid redirect rule: %s: %w", rule, ErrParseAddr)
++	}
++
++	pt, ok := t[fromIP]
++	if !ok {
++		pt = make(map[string]socks.Addr)
++		t[fromIP] = pt
++	}
++
++	pt[fromPort] = targ
++
++	return nil
++}
++
++func (t rdrTCPTable) redirect(addr socks.Addr) socks.Addr {
++	if len(t) == 0 {
++		return addr
++	}
++
++	if len(addr) > 0 && addr[0] == socks.AtypDomainName {
++		pa, err := net.ResolveTCPAddr("tcp", addr.String())
++		if err != nil {
++			return addr
++		}
++
++		addr = socks.ParseAddr(pa.String())
++	}
++
++	ip, port, err := net.SplitHostPort(addr.String())
++	if err != nil {
++		return addr
++	}
++
++	pt, ok := t[ip]
++	if !ok {
++		return addr
++	}
++
++	sa, ok := pt[port]
++	if !ok {
++		sa, ok = pt["0"]
++		if !ok {
++			return addr
++		}
++
++		targ := make(socks.Addr, len(sa))
++		copy(targ, sa)
++
++		if err := applyPortToSockAddr(targ, port); err != nil {
++			return addr
++		}
++
++		return targ
++	}
++
++	targ := make(socks.Addr, len(sa))
++	copy(targ, sa)
++
++	return targ
++}
++
++func applyPortToSockAddr(addr socks.Addr, port string) error {
++	portNum, err := strconv.ParseUint(port, 10, 16)
++	if err != nil {
++		return fmt.Errorf("invalid port: %s: %w", port, err)
++	}
++
++	addr[len(addr)-2], addr[len(addr)-1] = byte(portNum>>8), byte(portNum)
++
++	return nil
++}
++
++func (u rdrUDPTable) add(rule string) error {
++	from, to, ok := strings.Cut(rule, " to ")
++	if !ok {
++		return fmt.Errorf("invalid redirect rule: %s: %w", rule, ErrSplitRedirectRule)
++	}
++
++	fromIP, fromPort, err := net.SplitHostPort(from)
++	if err != nil {
++		ip := net.ParseIP(from)
++		if ip == nil || ip.IsUnspecified() {
++			return fmt.Errorf("invalid redirect rule: %s: from ip: %w", rule, ErrParseIP)
++		}
++
++		fromIP = ip.String()
++		fromPort = rdrMagicPort
++	}
++
++	toIP, toPort, err := net.SplitHostPort(to)
++	if err != nil {
++		ip := net.ParseIP(to)
++		if ip == nil || ip.IsUnspecified() {
++			return fmt.Errorf("invalid redirect rule: %s: from ip: %w", rule, ErrParseIP)
++		}
++
++		toIP = ip.String()
++		toPort = rdrMagicPort
++	}
++
++	targ, err := net.ResolveUDPAddr("udp", net.JoinHostPort(toIP, toPort))
++	if err != nil {
++		return fmt.Errorf("invalid redirect rule: %s: %w", rule, ErrParseAddr)
++	}
++
++	pt, ok := u[fromIP]
++	if !ok {
++		pt = make(map[string]*net.UDPAddr)
++		u[fromIP] = pt
++	}
++
++	pt[fromPort] = targ
++
++	return nil
++}
++
++func (u rdrUDPTable) redirect(addr net.Addr) net.Addr {
++	if len(u) == 0 {
++		return addr
++	}
++
++	ip, port, err := net.SplitHostPort(addr.String())
++	if err != nil {
++		return addr
++	}
++
++	pt, ok := u[ip]
++	if !ok {
++		return addr
++	}
++
++	sa, ok := pt[port]
++	if !ok {
++		sa, ok = pt["0"]
++		if !ok {
++			return addr
++		}
++	}
++
++	targ, err := net.ResolveUDPAddr("udp", net.JoinHostPort(sa.IP.String(), port))
++	if err != nil {
++		return addr
++	}
++
++	return targ
++}
++
++type redirectTable struct {
++	rdrTCPTable
++	rdrUDPTable
++}
++
++type Redirecter interface {
++	RedirectTCP(addr socks.Addr) socks.Addr
++	RedirectUDP(addr net.Addr) net.Addr
++}
++
++func (r *redirectTable) RedirectTCP(addr socks.Addr) socks.Addr {
++	if r == nil || r.rdrTCPTable == nil {
++		return addr
++	}
++
++	return r.rdrTCPTable.redirect(addr)
++}
++
++func (r *redirectTable) RedirectUDP(addr net.Addr) net.Addr {
++	if r == nil || r.rdrUDPTable == nil {
++		return addr
++	}
++
++	return r.rdrUDPTable.redirect(addr)
++}
++
++func NewRedirectTable(config *RedirectConfig) (Redirecter, error) {
++	if config == nil {
++		return (*redirectTable)(nil), nil
++	}
++
++	var (
++		tcpTable rdrTCPTable
++		udpTable rdrUDPTable
++	)
++
++	if len(config.TCP) != 0 {
++		tcpTable = make(rdrTCPTable)
++		for _, rule := range config.TCP {
++			if err := tcpTable.add(rule); err != nil {
++				return nil, err
++			}
++		}
++	}
++
++	if len(config.UDP) != 0 {
++		udpTable = make(rdrUDPTable)
++		for _, rule := range config.UDP {
++			if err := udpTable.add(rule); err != nil {
++				return nil, err
++			}
++		}
++	}
++
++	if len(tcpTable) == 0 && len(udpTable) == 0 {
++		return (*redirectTable)(nil), nil
++	}
++
++	return &redirectTable{tcpTable, udpTable}, nil
++}
+diff --git a/service/redirect_test.go b/service/redirect_test.go
+new file mode 100644
+index 0000000..dd8e98e
+--- /dev/null
++++ b/service/redirect_test.go
+@@ -0,0 +1,137 @@
++package service
++
++import (
++	"net"
++	"testing"
++
++	"github.com/shadowsocks/go-shadowsocks2/socks"
++	"gopkg.in/yaml.v2"
++)
++
++var testRedirects = `
++redirect:
++  tcp:
++    - "5.5.5.5 to 6.6.6.6"
++    - "5.5.5.5:80 to 7.7.6.6:8080"
++    - "7.7.7.7:443 to 8.8.8.8:8443"
++    - "[2001:db8::1]:80 to [2001:db8::2]:8080"
++  udp:
++    - "9.9.9.9 to 1.1.1.1"
++    - "9.9.9.9:123 to 9.9.9.9:123"
++    - "[2001:db8::1]:123 to [2001:db8::2]:123"
++`
++
++func rdrUnmarshalYAML(data string) (*RedirectConfig, error) {
++	var cfg struct {
++		Redirect RedirectConfig `yaml:"redirect"`
++	}
++
++	err := yaml.Unmarshal([]byte(data), &cfg)
++	return &cfg.Redirect, err
++}
++
++func TestAddRules(t *testing.T) {
++	conf, err := rdrUnmarshalYAML(testRedirects)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if len(conf.TCP) != 4 {
++		t.Errorf("Expected 4 TCP rules, got %d", len(conf.TCP))
++	}
++
++	if len(conf.UDP) != 3 {
++		t.Errorf("Expected 3 UDP rules, got %d", len(conf.UDP))
++	}
++}
++
++var testRdrTCPTabe = map[string]string{
++	"5.5.5.5:25":       "6.6.6.6:25",
++	"10.10.10.10:80":   "10.10.10.10:80",
++	"5.5.5.5:80":       "7.7.6.6:8080",
++	"7.7.7.7:443":      "8.8.8.8:8443",
++	"[2001:db8::1]:80": "[2001:db8::2]:8080",
++	"[2001:db8::1]:25": "[2001:db8::1]:25",
++}
++
++var testRdrUDPTabe = map[string]string{
++	"10.0.0.1:53":       "10.0.0.1:53",
++	"9.9.9.9:53":        "1.1.1.1:53",
++	"9.9.9.9:123":       "9.9.9.9:123",
++	"[2001:db8::1]:123": "[2001:db8::2]:123",
++	"[2001:db8::1]:53":  "[2001:db8::1]:53",
++}
++
++func TestNilRedirect(t *testing.T) {
++	rdr := (*redirectTable)(nil)
++
++	targ := "10.0.0.1:80"
++
++	addr1 := socks.ParseAddr(targ)
++	if addr1 == nil {
++		t.Fatal("ParseAddr failed")
++	}
++
++	res1 := rdr.RedirectTCP(addr1)
++	if res1.String() != targ {
++		t.Errorf("RedirectTCP(%s): expected %s, got %s", addr1, targ, res1)
++	}
++
++	addr2, err := net.ResolveUDPAddr("udp", targ)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	res2 := rdr.RedirectUDP(addr2)
++	if res2.String() != targ {
++		t.Errorf("RedirectUDP(%s): expected %s, got %s", addr2, targ, res2)
++	}
++}
++
++func TestRedirect(t *testing.T) {
++	conf, err := rdrUnmarshalYAML(testRedirects)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	rdr, err := NewRedirectTable(conf)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	for targ, expect := range testRdrTCPTabe {
++		addr := socks.ParseAddr(targ)
++		if addr == nil {
++			t.Errorf("ParseAddr(%s): %v", targ, err)
++			continue
++		}
++
++		result := rdr.RedirectTCP(addr)
++		if err != nil {
++			t.Errorf("RedirectTCP(%s): %v", addr, err)
++			continue
++		}
++
++		if result.String() != expect {
++			t.Errorf("RedirectTCP(%s): expected %s, got %s", addr, expect, result)
++		}
++	}
++
++	for targ, expect := range testRdrUDPTabe {
++		addr, err := net.ResolveUDPAddr("udp", targ)
++		if err != nil {
++			t.Errorf("ResolveUDPAddr(%s): %v", targ, err)
++			continue
++		}
++
++		result := rdr.RedirectUDP(addr)
++		if err != nil {
++			t.Errorf("RedirectUDP(%s): %v", addr, err)
++			continue
++		}
++
++		if result.String() != expect {
++			t.Errorf("RedirectUDP(%s): expected %s, got %s", addr, expect, result)
++		}
++	}
++}
+diff --git a/service/tcp.go b/service/tcp.go
+index a48a800..17b0459 100644
+--- a/service/tcp.go
++++ b/service/tcp.go
+@@ -159,17 +159,22 @@ func (s *tcpHandler) SetTargetIPValidator(targetIPValidator onet.TargetIPValidat
+ 
+ func dialTarget(tgtAddr socks.Addr, proxyMetrics *metrics.ProxyMetrics,
+ 	targetIPValidator onet.TargetIPValidator, bitFilterConnFunc func(*net.TCPConn) transport.StreamConn,
++	redirecter Redirecter,
+ ) (transport.StreamConn, *onet.ConnectionError) {
+ 	var ipError *onet.ConnectionError
++	fakeAddr, err := net.ResolveTCPAddr("tcp", tgtAddr.String())
++	if err != nil {
++		return nil, onet.NewConnectionError("ERR_RESOLVE", "Failed to resolve target address", err)
++	}
+ 	dialer := net.Dialer{Control: func(network, address string, c syscall.RawConn) error {
+-		ip, _, _ := net.SplitHostPort(address)
++		ip, _, _ := net.SplitHostPort(fakeAddr.String())
+ 		ipError = targetIPValidator(net.ParseIP(ip))
+ 		if ipError != nil {
+ 			return errors.New(ipError.Message)
+ 		}
+ 		return nil
+ 	}}
+-	tgtConn, err := dialer.Dial("tcp", tgtAddr.String())
++	tgtConn, err := dialer.Dial("tcp", redirecter.RedirectTCP(tgtAddr).String())
+ 	if ipError != nil {
+ 		return nil, ipError
+ 	} else if err != nil {
+@@ -295,7 +300,7 @@ func (h *tcpHandler) handleConnection(listenerPort int, clientConn transport.Str
+ 		return id, onet.NewConnectionError("ERR_READ_ADDRESS", "Failed to get target address", err)
+ 	}
+ 	logger.Debugf("address %s", clientConn.RemoteAddr().String())
+-	tgtConn, dialErr := dialTarget(tgtAddr, proxyMetrics, h.targetIPValidator, bitFilterConnFunc)
++	tgtConn, dialErr := dialTarget(tgtAddr, proxyMetrics, h.targetIPValidator, bitFilterConnFunc, cipherEntry.Redirect)
+ 	if dialErr != nil {
+ 		// We don't drain so dial errors and invalid addresses are communicated quickly.
+ 		return id, dialErr
+diff --git a/service/udp.go b/service/udp.go
+index b71fce5..95b6f4d 100644
+--- a/service/udp.go
++++ b/service/udp.go
+@@ -65,7 +65,7 @@ func debugUDPAddr(addr net.Addr, template string, val interface{}) {
+ // Decrypts src into dst. It tries each cipher until it finds one that authenticates
+ // correctly. dst and src must not overlap.
+ func findAccessKeyUDP(clientIP net.IP, dst, src []byte, cipherList CipherList) ([]byte, string, *shadowsocks.EncryptionKey,
+-	TrafficLimiter, func(net.PacketConn) net.PacketConn,
++	TrafficLimiter, func(net.PacketConn) net.PacketConn, Redirecter,
+ 	error,
+ ) {
+ 	// Try each cipher until we find one that authenticates successfully. This assumes that all ciphers are AEAD.
+@@ -74,6 +74,7 @@ func findAccessKeyUDP(clientIP net.IP, dst, src []byte, cipherList CipherList) (
+ 	for ci, entry := range snapshot {
+ 		id, cryptoKey := entry.Value.(*CipherEntry).ID, entry.Value.(*CipherEntry).CryptoKey
+ 		limiter := entry.Value.(*CipherEntry).TrafficLimiter
++		rdr := entry.Value.(*CipherEntry).Redirect
+ 		buf, err := shadowsocks.Unpack(dst, src, cryptoKey)
+ 		if err != nil {
+ 			debugUDP(id, "Failed to unpack: %v", err)
+@@ -85,9 +86,9 @@ func findAccessKeyUDP(clientIP net.IP, dst, src []byte, cipherList CipherList) (
+ 
+ 		bitFilterConnFunc := GetUDPBitFilterConnFunc(bittorentFilter, entry.Value.(*CipherEntry))
+ 
+-		return buf, id, cryptoKey, limiter, bitFilterConnFunc, nil
++		return buf, id, cryptoKey, limiter, bitFilterConnFunc, rdr, nil
+ 	}
+-	return nil, "", nil, nil, nil, errors.New("could not find valid cipher")
++	return nil, "", nil, nil, nil, nil, errors.New("could not find valid cipher")
+ }
+ 
+ type packetHandler struct {
+@@ -163,6 +164,7 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
+ 			targetConn := nm.Get(clientAddr.String())
+ 			if targetConn == nil {
+ 				var locErr error
++				var redirecter Redirecter
+ 				clientInfo, locErr = ipinfo.GetIPInfoFromAddr(h.m, clientAddr)
+ 				if locErr != nil {
+ 					logger.Warningf("Failed client info lookup: %v", locErr)
+@@ -174,7 +176,7 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
+ 				var cryptoKey *shadowsocks.EncryptionKey
+ 				var bitFilterConnFunc func(net.PacketConn) net.PacketConn
+ 				unpackStart := time.Now()
+-				textData, keyID, cryptoKey, limiter, bitFilterConnFunc, err = findAccessKeyUDP(ip, textBuf, cipherData, h.ciphers)
++				textData, keyID, cryptoKey, limiter, bitFilterConnFunc, redirecter, err = findAccessKeyUDP(ip, textBuf, cipherData, h.ciphers)
+ 				timeToCipher := time.Since(unpackStart)
+ 				h.m.AddUDPCipherSearch(err == nil, timeToCipher)
+ 
+@@ -192,7 +194,7 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
+ 					return onet.NewConnectionError("ERR_CREATE_SOCKET", "Failed to create UDP socket", err)
+ 				}
+ 				// TODO: WRAP udpConn with a bittorent filter h.ciphers....
+-				targetConn = nm.Add(clientAddr, clientConn, cryptoKey, bitFilterConnFunc(udpConn), clientInfo, keyID, limiter)
++				targetConn = nm.Add(clientAddr, clientConn, cryptoKey, bitFilterConnFunc(udpConn), clientInfo, keyID, limiter, redirecter)
+ 			} else {
+ 				clientInfo = targetConn.clientInfo
+ 
+@@ -265,9 +267,10 @@ func isDNS(addr net.Addr) bool {
+ 
+ type natconn struct {
+ 	net.PacketConn
+-	cryptoKey *shadowsocks.EncryptionKey
+-	keyID     string
+-	limiter   TrafficLimiter
++	cryptoKey  *shadowsocks.EncryptionKey
++	keyID      string
++	limiter    TrafficLimiter
++	redirecter Redirecter
+ 	// We store the client information in the NAT map to avoid recomputing it
+ 	// for every downstream packet in a UDP-based connection.
+ 	clientInfo ipinfo.IPInfo
+@@ -314,7 +317,8 @@ func (c *natconn) onRead(addr net.Addr) {
+ }
+ 
+ func (c *natconn) WriteTo(buf []byte, dst net.Addr) (int, error) {
+-	c.onWrite(dst)
++	actualDst := c.redirecter.RedirectUDP(dst)
++	c.onWrite(actualDst)
+ 	return c.PacketConn.WriteTo(buf, dst)
+ }
+ 
+@@ -349,13 +353,14 @@ func (m *natmap) Get(key string) *natconn {
+ }
+ 
+ func (m *natmap) set(key string, pc net.PacketConn, cryptoKey *shadowsocks.EncryptionKey, keyID string, clientInfo ipinfo.IPInfo,
+-	limiter TrafficLimiter,
++	limiter TrafficLimiter, redirecter Redirecter,
+ ) *natconn {
+ 	entry := &natconn{
+ 		PacketConn:     pc,
+ 		cryptoKey:      cryptoKey,
+ 		keyID:          keyID,
+ 		limiter:        limiter,
++		redirecter:     redirecter,
+ 		clientInfo:     clientInfo,
+ 		defaultTimeout: m.timeout,
+ 	}
+@@ -380,9 +385,9 @@ func (m *natmap) del(key string) net.PacketConn {
+ }
+ 
+ func (m *natmap) Add(clientAddr net.Addr, clientConn net.PacketConn, cryptoKey *shadowsocks.EncryptionKey, targetConn net.PacketConn, clientInfo ipinfo.IPInfo,
+-	keyID string, limiter TrafficLimiter,
++	keyID string, limiter TrafficLimiter, redirecter Redirecter,
+ ) *natconn {
+-	entry := m.set(clientAddr.String(), targetConn, cryptoKey, keyID, clientInfo, limiter)
++	entry := m.set(clientAddr.String(), targetConn, cryptoKey, keyID, clientInfo, limiter, redirecter)
+ 
+ 	m.metrics.AddUDPNatEntry()
+ 	m.running.Add(1)
+diff --git a/service/udp_test.go b/service/udp_test.go
+index 3f52202..b7f0ba9 100644
+--- a/service/udp_test.go
++++ b/service/udp_test.go
+@@ -227,7 +227,8 @@ func setupNAT() (*fakePacketConn, *fakePacketConn, *natconn) {
+ 	ciphers, _ := cipherList.SnapshotForClientIP(net.IP{})
+ 	entrySnap := ciphers[0].Value
+ 	key, limiter := entrySnap.(*CipherEntry).ID, entrySnap.(*CipherEntry).TrafficLimiter
+-	nat.Add(&clientAddr, clientConn, natCryptoKey, targetConn, ipinfo.IPInfo{CountryCode: "ZZ"}, key, limiter)
++	rdr, _ := NewRedirectTable(nil)
++	nat.Add(&clientAddr, clientConn, natCryptoKey, targetConn, ipinfo.IPInfo{CountryCode: "ZZ"}, key, limiter, rdr)
+ 	entry := nat.Get(clientAddr.String())
+ 	return clientConn, targetConn, entry
+ }
+@@ -449,7 +450,7 @@ func BenchmarkUDPUnpackRepeat(b *testing.B) {
+ 		cipherNumber := n % numCiphers
+ 		ip := ips[cipherNumber]
+ 		packet := packets[cipherNumber]
+-		_, _, _, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
++		_, _, _, _, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
+ 		if err != nil {
+ 			b.Error(err)
+ 		}
+@@ -478,7 +479,7 @@ func BenchmarkUDPUnpackSharedKey(b *testing.B) {
+ 	b.ResetTimer()
+ 	for n := 0; n < b.N; n++ {
+ 		ip := ips[n%numIPs]
+-		_, _, _, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
++		_, _, _, _, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
+ 		if err != nil {
+ 			b.Error(err)
+ 		}
