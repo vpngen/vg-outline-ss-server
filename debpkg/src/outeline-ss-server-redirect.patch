@@ -1,5 +1,5 @@
 diff --git a/cmd/outline-ss-server/config_example.yml b/cmd/outline-ss-server/config_example.yml
-index 1174509..9cafb1e 100644
+index 1174509..81489f8 100644
 --- a/cmd/outline-ss-server/config_example.yml
 +++ b/cmd/outline-ss-server/config_example.yml
 @@ -14,6 +14,12 @@ keys:
@@ -8,9 +8,9 @@ index 1174509..9cafb1e 100644
      send_limit: 128000
 +    redirect:
 +      udp:
-+        - "1.1.1.1:53 to 8.8.8.8:53"
++        - "1.1.1.1:53 to 8.8.8.8:53 via 192.168.0.1"
 +      tcp:
-+        - "1.1.1.1:53 to 8.8.8.8:53"
++        - "1.1.1.1:53 to 8.8.8.8:53 via 192.168.0.1"
 +        - "93.184.216.34 to 1.1.1.1"
  
    - id: user-1
@@ -102,10 +102,10 @@ index b4b8a6c..26ccc73 100644
  	cipherList := NewCipherList()
 diff --git a/service/redirect.go b/service/redirect.go
 new file mode 100644
-index 0000000..9a760d5
+index 0000000..e96b6c5
 --- /dev/null
 +++ b/service/redirect.go
-@@ -0,0 +1,274 @@
+@@ -0,0 +1,347 @@
 +package service
 +
 +import (
@@ -123,10 +123,20 @@ index 0000000..9a760d5
 +}
 +
 +type (
-+	rdrTCPPortTable map[string]socks.Addr
++	udpRedirect struct {
++		localAddr  *net.UDPAddr
++		remoteAddr *net.UDPAddr
++	}
++
++	tcpRedirect struct {
++		localAddr  *net.TCPAddr
++		remoteAddr socks.Addr
++	}
++
++	rdrTCPPortTable map[string]tcpRedirect
 +	rdrTCPTable     map[string]rdrTCPPortTable
 +
-+	rdrUDPPortTable map[string]*net.UDPAddr
++	rdrUDPPortTable map[string]udpRedirect
 +	rdrUDPTable     map[string]rdrUDPPortTable
 +)
 +
@@ -144,12 +154,25 @@ index 0000000..9a760d5
 +const rdrMagicPort = "0"
 +
 +func (t rdrTCPTable) add(rule string) error {
-+	from, to, ok := strings.Cut(rule, " to ")
++	from, rest, ok := strings.Cut(strings.TrimSpace(rule), " to ")
 +	if !ok {
 +		return fmt.Errorf("invalid redirect rule: %s: %w", rule, ErrSplitRedirectRule)
 +	}
 +
-+	fromIP, fromPort, err := net.SplitHostPort(from)
++	var (
++		src = &net.TCPAddr{}
++		err error
++	)
++
++	to, via, ok := strings.Cut(rest, " via ")
++	if ok {
++		src, err = net.ResolveTCPAddr("tcp", net.JoinHostPort(strings.TrimSpace(via), rdrMagicPort))
++		if err != nil {
++			return fmt.Errorf("invalid redirect rule: %s: via ip: %w", rule, ErrParseIP)
++		}
++	}
++
++	fromIP, fromPort, err := net.SplitHostPort(strings.TrimSpace(from))
 +	if err != nil {
 +		ip := net.ParseIP(from)
 +		if ip == nil || ip.IsUnspecified() {
@@ -160,7 +183,7 @@ index 0000000..9a760d5
 +		fromPort = rdrMagicPort
 +	}
 +
-+	toIP, toPort, err := net.SplitHostPort(to)
++	toIP, toPort, err := net.SplitHostPort(strings.TrimSpace(to))
 +	if err != nil {
 +		ip := net.ParseIP(to)
 +		if ip == nil || ip.IsUnspecified() {
@@ -178,24 +201,24 @@ index 0000000..9a760d5
 +
 +	pt, ok := t[fromIP]
 +	if !ok {
-+		pt = make(map[string]socks.Addr)
++		pt = make(rdrTCPPortTable)
 +		t[fromIP] = pt
 +	}
 +
-+	pt[fromPort] = targ
++	pt[fromPort] = tcpRedirect{localAddr: src, remoteAddr: targ}
 +
 +	return nil
 +}
 +
-+func (t rdrTCPTable) redirect(addr socks.Addr) socks.Addr {
++func (t rdrTCPTable) redirect(addr socks.Addr) (*net.TCPAddr, socks.Addr) {
 +	if len(t) == 0 {
-+		return addr
++		return &net.TCPAddr{}, addr
 +	}
 +
 +	if len(addr) > 0 && addr[0] == socks.AtypDomainName {
 +		pa, err := net.ResolveTCPAddr("tcp", addr.String())
 +		if err != nil {
-+			return addr
++			return &net.TCPAddr{}, addr
 +		}
 +
 +		addr = socks.ParseAddr(pa.String())
@@ -203,35 +226,35 @@ index 0000000..9a760d5
 +
 +	ip, port, err := net.SplitHostPort(addr.String())
 +	if err != nil {
-+		return addr
++		return &net.TCPAddr{}, addr
 +	}
 +
 +	pt, ok := t[ip]
 +	if !ok {
-+		return addr
++		return &net.TCPAddr{}, addr
 +	}
 +
 +	sa, ok := pt[port]
 +	if !ok {
-+		sa, ok = pt["0"]
++		sa, ok := pt["0"]
 +		if !ok {
-+			return addr
++			return &net.TCPAddr{}, addr
 +		}
 +
-+		targ := make(socks.Addr, len(sa))
-+		copy(targ, sa)
++		targ := make(socks.Addr, len(sa.remoteAddr))
++		copy(targ, sa.remoteAddr)
 +
 +		if err := applyPortToSockAddr(targ, port); err != nil {
-+			return addr
++			return &net.TCPAddr{}, addr
 +		}
 +
-+		return targ
++		return sa.localAddr, targ
 +	}
 +
-+	targ := make(socks.Addr, len(sa))
-+	copy(targ, sa)
++	targ := make(socks.Addr, len(sa.remoteAddr))
++	copy(targ, sa.remoteAddr)
 +
-+	return targ
++	return sa.localAddr, targ
 +}
 +
 +func applyPortToSockAddr(addr socks.Addr, port string) error {
@@ -246,12 +269,25 @@ index 0000000..9a760d5
 +}
 +
 +func (u rdrUDPTable) add(rule string) error {
-+	from, to, ok := strings.Cut(rule, " to ")
++	from, rest, ok := strings.Cut(strings.TrimSpace(rule), " to ")
 +	if !ok {
 +		return fmt.Errorf("invalid redirect rule: %s: %w", rule, ErrSplitRedirectRule)
 +	}
 +
-+	fromIP, fromPort, err := net.SplitHostPort(from)
++	var (
++		src = &net.UDPAddr{}
++		err error
++	)
++
++	to, via, ok := strings.Cut(rest, " via ")
++	if ok {
++		src, err = net.ResolveUDPAddr("udp", net.JoinHostPort(strings.TrimSpace(via), rdrMagicPort))
++		if err != nil {
++			return fmt.Errorf("invalid redirect rule: %s: via ip: %w", rule, ErrParseIP)
++		}
++	}
++
++	fromIP, fromPort, err := net.SplitHostPort(strings.TrimSpace(from))
 +	if err != nil {
 +		ip := net.ParseIP(from)
 +		if ip == nil || ip.IsUnspecified() {
@@ -262,7 +298,7 @@ index 0000000..9a760d5
 +		fromPort = rdrMagicPort
 +	}
 +
-+	toIP, toPort, err := net.SplitHostPort(to)
++	toIP, toPort, err := net.SplitHostPort(strings.TrimSpace(to))
 +	if err != nil {
 +		ip := net.ParseIP(to)
 +		if ip == nil || ip.IsUnspecified() {
@@ -280,11 +316,11 @@ index 0000000..9a760d5
 +
 +	pt, ok := u[fromIP]
 +	if !ok {
-+		pt = make(map[string]*net.UDPAddr)
++		pt = make(rdrUDPPortTable)
 +		u[fromIP] = pt
 +	}
 +
-+	pt[fromPort] = targ
++	pt[fromPort] = udpRedirect{localAddr: src, remoteAddr: targ}
 +
 +	return nil
 +}
@@ -306,18 +342,46 @@ index 0000000..9a760d5
 +
 +	sa, ok := pt[port]
 +	if !ok {
-+		sa, ok = pt["0"]
++		sa, ok := pt["0"]
 +		if !ok {
 +			return addr
 +		}
++
++		targ, err := net.ResolveUDPAddr("udp", net.JoinHostPort(sa.remoteAddr.IP.String(), port))
++		if err != nil {
++			return addr
++		}
++
++		return targ
 +	}
 +
-+	targ, err := net.ResolveUDPAddr("udp", net.JoinHostPort(sa.IP.String(), port))
++	return sa.remoteAddr
++}
++
++func (u rdrUDPTable) source(addr net.Addr) net.Addr {
++	if len(u) == 0 {
++		return &net.UDPAddr{}
++	}
++
++	ip, port, err := net.SplitHostPort(addr.String())
 +	if err != nil {
-+		return addr
++		return &net.UDPAddr{}
 +	}
 +
-+	return targ
++	pt, ok := u[ip]
++	if !ok {
++		return &net.UDPAddr{}
++	}
++
++	sa, ok := pt[port]
++	if !ok {
++		sa, ok = pt["0"]
++		if !ok {
++			return &net.UDPAddr{}
++		}
++	}
++
++	return sa.localAddr
 +}
 +
 +type redirectTable struct {
@@ -326,13 +390,14 @@ index 0000000..9a760d5
 +}
 +
 +type Redirecter interface {
-+	RedirectTCP(addr socks.Addr) socks.Addr
++	RedirectTCP(addr socks.Addr) (*net.TCPAddr, socks.Addr)
 +	RedirectUDP(addr net.Addr) net.Addr
++	SourceUDP(addr net.Addr) net.Addr
 +}
 +
-+func (r *redirectTable) RedirectTCP(addr socks.Addr) socks.Addr {
++func (r *redirectTable) RedirectTCP(addr socks.Addr) (*net.TCPAddr, socks.Addr) {
 +	if r == nil || r.rdrTCPTable == nil {
-+		return addr
++		return &net.TCPAddr{}, addr
 +	}
 +
 +	return r.rdrTCPTable.redirect(addr)
@@ -344,6 +409,14 @@ index 0000000..9a760d5
 +	}
 +
 +	return r.rdrUDPTable.redirect(addr)
++}
++
++func (r *redirectTable) SourceUDP(addr net.Addr) net.Addr {
++	if r == nil || r.rdrUDPTable == nil {
++		return &net.UDPAddr{}
++	}
++
++	return r.rdrUDPTable.source(addr)
 +}
 +
 +func NewRedirectTable(config *RedirectConfig) (Redirecter, error) {
@@ -382,10 +455,10 @@ index 0000000..9a760d5
 +}
 diff --git a/service/redirect_test.go b/service/redirect_test.go
 new file mode 100644
-index 0000000..dd8e98e
+index 0000000..fd668e6
 --- /dev/null
 +++ b/service/redirect_test.go
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,147 @@
 +package service
 +
 +import (
@@ -401,12 +474,12 @@ index 0000000..dd8e98e
 +  tcp:
 +    - "5.5.5.5 to 6.6.6.6"
 +    - "5.5.5.5:80 to 7.7.6.6:8080"
-+    - "7.7.7.7:443 to 8.8.8.8:8443"
++    - "7.7.7.7:443 to 8.8.8.8:8443 via 3.3.3.3"
 +    - "[2001:db8::1]:80 to [2001:db8::2]:8080"
 +  udp:
 +    - "9.9.9.9 to 1.1.1.1"
 +    - "9.9.9.9:123 to 9.9.9.9:123"
-+    - "[2001:db8::1]:123 to [2001:db8::2]:123"
++    - "[2001:db8::1]:123 to [2001:db8::2]:123 via ::1"
 +`
 +
 +func rdrUnmarshalYAML(data string) (*RedirectConfig, error) {
@@ -433,21 +506,21 @@ index 0000000..dd8e98e
 +	}
 +}
 +
-+var testRdrTCPTabe = map[string]string{
-+	"5.5.5.5:25":       "6.6.6.6:25",
-+	"10.10.10.10:80":   "10.10.10.10:80",
-+	"5.5.5.5:80":       "7.7.6.6:8080",
-+	"7.7.7.7:443":      "8.8.8.8:8443",
-+	"[2001:db8::1]:80": "[2001:db8::2]:8080",
-+	"[2001:db8::1]:25": "[2001:db8::1]:25",
++var testRdrTCPTabe = map[string][2]string{
++	"5.5.5.5:25":       {"6.6.6.6:25", ":0"},
++	"10.10.10.10:80":   {"10.10.10.10:80", ":0"},
++	"5.5.5.5:80":       {"7.7.6.6:8080", ":0"},
++	"7.7.7.7:443":      {"8.8.8.8:8443", "3.3.3.3:0"},
++	"[2001:db8::1]:80": {"[2001:db8::2]:8080", ":0"},
++	"[2001:db8::1]:25": {"[2001:db8::1]:25", ":0"},
 +}
 +
-+var testRdrUDPTabe = map[string]string{
-+	"10.0.0.1:53":       "10.0.0.1:53",
-+	"9.9.9.9:53":        "1.1.1.1:53",
-+	"9.9.9.9:123":       "9.9.9.9:123",
-+	"[2001:db8::1]:123": "[2001:db8::2]:123",
-+	"[2001:db8::1]:53":  "[2001:db8::1]:53",
++var testRdrUDPTabe = map[string][2]string{
++	"10.0.0.1:53":       {"10.0.0.1:53", ":0"},
++	"9.9.9.9:53":        {"1.1.1.1:53", ":0"},
++	"9.9.9.9:123":       {"9.9.9.9:123", ":0"},
++	"[2001:db8::1]:123": {"[2001:db8::2]:123", "[::1]:0"},
++	"[2001:db8::1]:53":  {"[2001:db8::1]:53", ":0"},
 +}
 +
 +func TestNilRedirect(t *testing.T) {
@@ -460,7 +533,7 @@ index 0000000..dd8e98e
 +		t.Fatal("ParseAddr failed")
 +	}
 +
-+	res1 := rdr.RedirectTCP(addr1)
++	_, res1 := rdr.RedirectTCP(addr1)
 +	if res1.String() != targ {
 +		t.Errorf("RedirectTCP(%s): expected %s, got %s", addr1, targ, res1)
 +	}
@@ -494,14 +567,18 @@ index 0000000..dd8e98e
 +			continue
 +		}
 +
-+		result := rdr.RedirectTCP(addr)
++		lAddr, rAddr := rdr.RedirectTCP(addr)
 +		if err != nil {
 +			t.Errorf("RedirectTCP(%s): %v", addr, err)
 +			continue
 +		}
 +
-+		if result.String() != expect {
-+			t.Errorf("RedirectTCP(%s): expected %s, got %s", addr, expect, result)
++		if rAddr.String() != expect[0] {
++			t.Errorf("RedirectTCP(%s): expected %s, got %s", addr, expect, rAddr)
++		}
++
++		if lAddr.String() != expect[1] {
++			t.Errorf("RedirectTCP(%s): expected %s, got %s", addr, expect, lAddr)
 +		}
 +	}
 +
@@ -512,22 +589,28 @@ index 0000000..dd8e98e
 +			continue
 +		}
 +
-+		result := rdr.RedirectUDP(addr)
++		rAddr := rdr.RedirectUDP(addr)
 +		if err != nil {
 +			t.Errorf("RedirectUDP(%s): %v", addr, err)
 +			continue
 +		}
 +
-+		if result.String() != expect {
-+			t.Errorf("RedirectUDP(%s): expected %s, got %s", addr, expect, result)
++		if rAddr.String() != expect[0] {
++			t.Errorf("RedirectUDP(%s): expected %s, got %s", addr, expect, rAddr)
++		}
++
++		lAddr := rdr.SourceUDP(addr)
++
++		if lAddr.String() != expect[1] {
++			t.Errorf("SourceUDP(%s): expected %s, got %s", addr, expect, lAddr)
 +		}
 +	}
 +}
 diff --git a/service/tcp.go b/service/tcp.go
-index a48a800..17b0459 100644
+index a48a800..7de509b 100644
 --- a/service/tcp.go
 +++ b/service/tcp.go
-@@ -159,17 +159,22 @@ func (s *tcpHandler) SetTargetIPValidator(targetIPValidator onet.TargetIPValidat
+@@ -159,17 +159,23 @@ func (s *tcpHandler) SetTargetIPValidator(targetIPValidator onet.TargetIPValidat
  
  func dialTarget(tgtAddr socks.Addr, proxyMetrics *metrics.ProxyMetrics,
  	targetIPValidator onet.TargetIPValidator, bitFilterConnFunc func(*net.TCPConn) transport.StreamConn,
@@ -538,6 +621,7 @@ index a48a800..17b0459 100644
 +	if err != nil {
 +		return nil, onet.NewConnectionError("ERR_RESOLVE", "Failed to resolve target address", err)
 +	}
++	localAddr, remoteAddr := redirecter.RedirectTCP(tgtAddr)
  	dialer := net.Dialer{Control: func(network, address string, c syscall.RawConn) error {
 -		ip, _, _ := net.SplitHostPort(address)
 +		ip, _, _ := net.SplitHostPort(fakeAddr.String())
@@ -546,13 +630,14 @@ index a48a800..17b0459 100644
  			return errors.New(ipError.Message)
  		}
  		return nil
- 	}}
+-	}}
 -	tgtConn, err := dialer.Dial("tcp", tgtAddr.String())
-+	tgtConn, err := dialer.Dial("tcp", redirecter.RedirectTCP(tgtAddr).String())
++	}, LocalAddr: localAddr}
++	tgtConn, err := dialer.Dial("tcp", remoteAddr.String())
  	if ipError != nil {
  		return nil, ipError
  	} else if err != nil {
-@@ -295,7 +300,7 @@ func (h *tcpHandler) handleConnection(listenerPort int, clientConn transport.Str
+@@ -295,7 +301,7 @@ func (h *tcpHandler) handleConnection(listenerPort int, clientConn transport.Str
  		return id, onet.NewConnectionError("ERR_READ_ADDRESS", "Failed to get target address", err)
  	}
  	logger.Debugf("address %s", clientConn.RemoteAddr().String())
@@ -562,7 +647,7 @@ index a48a800..17b0459 100644
  		// We don't drain so dial errors and invalid addresses are communicated quickly.
  		return id, dialErr
 diff --git a/service/udp.go b/service/udp.go
-index b71fce5..902694b 100644
+index b71fce5..7cedd92 100644
 --- a/service/udp.go
 +++ b/service/udp.go
 @@ -65,7 +65,7 @@ func debugUDPAddr(addr net.Addr, template string, val interface{}) {
@@ -611,7 +696,13 @@ index b71fce5..902694b 100644
  				timeToCipher := time.Since(unpackStart)
  				h.m.AddUDPCipherSearch(err == nil, timeToCipher)
  
-@@ -192,7 +194,7 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
+@@ -187,12 +189,12 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
+ 					return onetErr
+ 				}
+ 
+-				udpConn, err := net.ListenPacket("udp", "")
++				udpConn, err := net.ListenPacket("udp", redirecter.SourceUDP(tgtUDPAddr).String())
+ 				if err != nil {
  					return onet.NewConnectionError("ERR_CREATE_SOCKET", "Failed to create UDP socket", err)
  				}
  				// TODO: WRAP udpConn with a bittorent filter h.ciphers....
