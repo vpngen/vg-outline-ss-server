@@ -1,5 +1,5 @@
 diff --git a/cmd/outline-ss-server/config_example.yml b/cmd/outline-ss-server/config_example.yml
-index 1174509..81489f8 100644
+index 1174509..ff1eef1 100644
 --- a/cmd/outline-ss-server/config_example.yml
 +++ b/cmd/outline-ss-server/config_example.yml
 @@ -14,6 +14,12 @@ keys:
@@ -10,7 +10,7 @@ index 1174509..81489f8 100644
 +      udp:
 +        - "1.1.1.1:53 to 8.8.8.8:53 via 192.168.0.1"
 +      tcp:
-+        - "1.1.1.1:53 to 8.8.8.8:53 via 192.168.0.1"
++        - "1.1.1.1:443 to 8.8.8.8:443 via 192.168.0.3"
 +        - "93.184.216.34 to 1.1.1.1"
  
    - id: user-1
@@ -607,19 +607,20 @@ index 0000000..fd668e6
 +	}
 +}
 diff --git a/service/tcp.go b/service/tcp.go
-index a48a800..7de509b 100644
+index a48a800..687c70b 100644
 --- a/service/tcp.go
 +++ b/service/tcp.go
-@@ -159,17 +159,23 @@ func (s *tcpHandler) SetTargetIPValidator(targetIPValidator onet.TargetIPValidat
+@@ -159,26 +159,32 @@ func (s *tcpHandler) SetTargetIPValidator(targetIPValidator onet.TargetIPValidat
  
  func dialTarget(tgtAddr socks.Addr, proxyMetrics *metrics.ProxyMetrics,
  	targetIPValidator onet.TargetIPValidator, bitFilterConnFunc func(*net.TCPConn) transport.StreamConn,
+-) (transport.StreamConn, *onet.ConnectionError) {
 +	redirecter Redirecter,
- ) (transport.StreamConn, *onet.ConnectionError) {
++) (transport.StreamConn, net.Addr, *onet.ConnectionError) {
  	var ipError *onet.ConnectionError
 +	fakeAddr, err := net.ResolveTCPAddr("tcp", tgtAddr.String())
 +	if err != nil {
-+		return nil, onet.NewConnectionError("ERR_RESOLVE", "Failed to resolve target address", err)
++		return nil, nil, onet.NewConnectionError("ERR_RESOLVE", "Failed to resolve target address", err)
 +	}
 +	localAddr, remoteAddr := redirecter.RedirectTCP(tgtAddr)
  	dialer := net.Dialer{Control: func(network, address string, c syscall.RawConn) error {
@@ -635,17 +636,38 @@ index a48a800..7de509b 100644
 +	}, LocalAddr: localAddr}
 +	tgtConn, err := dialer.Dial("tcp", remoteAddr.String())
  	if ipError != nil {
- 		return nil, ipError
+-		return nil, ipError
++		return nil, nil, ipError
  	} else if err != nil {
+-		return nil, onet.NewConnectionError("ERR_CONNECT", "Failed to connect to target", err)
++		return nil, nil, onet.NewConnectionError("ERR_CONNECT", "Failed to connect to target", err)
+ 	}
+ 	// TODO: Wrap the connection with bittorent filter.
+ 	tgtTCPConn := tgtConn.(*net.TCPConn)
+ 	tgtTCPConn.SetKeepAlive(true)
+-	return metrics.MeasureConn(bitFilterConnFunc(tgtTCPConn), &proxyMetrics.ProxyTarget, &proxyMetrics.TargetProxy), nil
++	return metrics.MeasureConn(bitFilterConnFunc(tgtTCPConn), &proxyMetrics.ProxyTarget, &proxyMetrics.TargetProxy), localAddr, nil
+ }
+ 
+ type StreamListener func() (transport.StreamConn, error)
 @@ -295,7 +301,7 @@ func (h *tcpHandler) handleConnection(listenerPort int, clientConn transport.Str
  		return id, onet.NewConnectionError("ERR_READ_ADDRESS", "Failed to get target address", err)
  	}
  	logger.Debugf("address %s", clientConn.RemoteAddr().String())
 -	tgtConn, dialErr := dialTarget(tgtAddr, proxyMetrics, h.targetIPValidator, bitFilterConnFunc)
-+	tgtConn, dialErr := dialTarget(tgtAddr, proxyMetrics, h.targetIPValidator, bitFilterConnFunc, cipherEntry.Redirect)
++	tgtConn, laddr, dialErr := dialTarget(tgtAddr, proxyMetrics, h.targetIPValidator, bitFilterConnFunc, cipherEntry.Redirect)
  	if dialErr != nil {
  		// We don't drain so dial errors and invalid addresses are communicated quickly.
  		return id, dialErr
+@@ -303,7 +309,7 @@ func (h *tcpHandler) handleConnection(listenerPort int, clientConn transport.Str
+ 	defer tgtConn.Close()
+ 
+ 	// 4. Bridge the client and target connections
+-	logger.Debugf("proxy %s <-> %s", clientConn.RemoteAddr().String(), tgtConn.RemoteAddr().String())
++	logger.Debugf("proxy %s <-> %s via %s", clientConn.RemoteAddr().String(), tgtConn.RemoteAddr().String(), laddr.String())
+ 	ssw := shadowsocks.NewWriter(clientWriter, cipherEntry.CryptoKey)
+ 	ssw.SetSaltGenerator(cipherEntry.SaltGenerator)
+ 
 diff --git a/service/udp.go b/service/udp.go
 index b71fce5..7cedd92 100644
 --- a/service/udp.go
