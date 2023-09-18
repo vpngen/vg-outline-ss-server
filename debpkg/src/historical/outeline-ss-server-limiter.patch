@@ -1,32 +1,29 @@
 diff --git a/cmd/outline-ss-server/config_example.yml b/cmd/outline-ss-server/config_example.yml
-index 8895b86..aa4c56c 100644
+index 8895b86..b005451 100644
 --- a/cmd/outline-ss-server/config_example.yml
 +++ b/cmd/outline-ss-server/config_example.yml
-@@ -1,15 +1,22 @@
+@@ -1,15 +1,19 @@
 +bind_address: "127.0.0.1"
  keys:
    - id: user-0
      port: 9000
      cipher: chacha20-ietf-poly1305
      secret: Secret0
-+    recv_limit: 128000
-+    send_limit: 128000
++    rate_limit: 128000
  
    - id: user-1
      port: 9000
      cipher: chacha20-ietf-poly1305
      secret: Secret1
-+    recv_limit: 128000
-+    send_limit: 128000
++    rate_limit: 128000
  
    - id: user-2
      port: 9001
      cipher: chacha20-ietf-poly1305
      secret: Secret2
-+    recv_limit: 128000
-+    send_limit: 128000
++    rate_limit: 128000
 diff --git a/cmd/outline-ss-server/main.go b/cmd/outline-ss-server/main.go
-index 748003e..b1d3a60 100644
+index 748003e..5d09e71 100644
 --- a/cmd/outline-ss-server/main.go
 +++ b/cmd/outline-ss-server/main.go
 @@ -49,7 +49,7 @@ const tcpReadTimeout time.Duration = 59 * time.Second
@@ -44,7 +41,7 @@ index 748003e..b1d3a60 100644
  
 -func (s *SSServer) startPort(portNum int) error {
 -	listener, err := net.ListenTCP("tcp", &net.TCPAddr{Port: portNum})
-+func (s *SSServer) startPort(portNum int, ipAddr string) error {
++func (s *SSServer) startPort(portNum int, ipAddr string, trafficLimiterConfig *service.TrafficLimiterConfig) error {
 +	listenIP := net.ParseIP(ipAddr)
 +	listener, err := net.ListenTCP("tcp", &net.TCPAddr{Port: portNum, IP: listenIP})
  	if err != nil {
@@ -57,7 +54,19 @@ index 748003e..b1d3a60 100644
  	if err != nil {
  		//lint:ignore ST1005 Shadowsocks is capitalized.
  		return fmt.Errorf("Shadowsocks UDP service failed to start on port %v: %w", portNum, err)
-@@ -123,12 +124,18 @@ func (s *SSServer) removePort(portNum int) error {
+@@ -87,8 +88,9 @@ func (s *SSServer) startPort(portNum int) error {
+ 	logger.Infof("Shadowsocks UDP service listening on %v", packetConn.LocalAddr().String())
+ 	port := &ssPort{tcpListener: listener, packetConn: packetConn, cipherList: service.NewCipherList()}
+ 	// TODO: Register initial data metrics at zero.
+-	tcpHandler := service.NewTCPHandler(portNum, port.cipherList, &s.replayCache, s.m, tcpReadTimeout)
+-	packetHandler := service.NewPacketHandler(s.natTimeout, port.cipherList, s.m)
++	limiter := service.NewTrafficLimiter(trafficLimiterConfig)
++	tcpHandler := service.NewTCPHandler(portNum, port.cipherList, &s.replayCache, s.m, tcpReadTimeout, limiter)
++	packetHandler := service.NewPacketHandler(s.natTimeout, port.cipherList, s.m, limiter)
+ 	s.ports[portNum] = port
+ 	accept := func() (transport.StreamConn, error) {
+ 		conn, err := listener.AcceptTCP()
+@@ -123,14 +125,21 @@ func (s *SSServer) removePort(portNum int) error {
  	return nil
  }
  
@@ -76,27 +85,35 @@ index 748003e..b1d3a60 100644
 +
  	portChanges := make(map[int]int)
  	portCiphers := make(map[int]*list.List) // Values are *List of *CipherEntry.
++	portKeyLimits := make(map[int]map[string]int)
  	for _, keyConfig := range config.Keys {
-@@ -142,7 +149,8 @@ func (s *SSServer) loadConfig(filename string) error {
- 		if err != nil {
- 			return fmt.Errorf("failed to create encyption key for key %v: %w", keyConfig.ID, err)
+ 		portChanges[keyConfig.Port] = 1
+ 		cipherList, ok := portCiphers[keyConfig.Port]
+@@ -144,6 +153,13 @@ func (s *SSServer) loadConfig(filename string) error {
  		}
--		entry := service.MakeCipherEntry(keyConfig.ID, cryptoKey, keyConfig.Secret)
-+		entry := service.MakeCipherEntry(keyConfig.ID, cryptoKey, keyConfig.Secret,
-+			service.NewTrafficLimiter(keyConfig.RecvLimit, keyConfig.SendLimit))
+ 		entry := service.MakeCipherEntry(keyConfig.ID, cryptoKey, keyConfig.Secret)
  		cipherList.PushBack(&entry)
++		var keyLimits map[string]int
++		keyLimits, ok = portKeyLimits[keyConfig.Port]
++		if !ok {
++			keyLimits = make(map[string]int)
++			portKeyLimits[keyConfig.Port] = keyLimits
++		}
++		keyLimits[keyConfig.ID] = keyConfig.RateLimit
  	}
  	for port := range s.ports {
-@@ -154,7 +162,7 @@ func (s *SSServer) loadConfig(filename string) error {
+ 		portChanges[port] = portChanges[port] - 1
+@@ -154,7 +170,8 @@ func (s *SSServer) loadConfig(filename string) error {
  				return fmt.Errorf("failed to remove port %v: %w", portNum, err)
  			}
  		} else if count == +1 {
 -			if err := s.startPort(portNum); err != nil {
-+			if err := s.startPort(portNum, bindAddr); err != nil {
++			trafficLimiterConfig := &service.TrafficLimiterConfig{KeyToRateLimit: portKeyLimits[portNum]}
++			if err := s.startPort(portNum, bindAddr, trafficLimiterConfig); err != nil {
  				return err
  			}
  		}
-@@ -178,14 +186,16 @@ func (s *SSServer) Stop() error {
+@@ -178,14 +195,16 @@ func (s *SSServer) Stop() error {
  }
  
  // RunSSServer starts a shadowsocks server running, and returns the server or an error.
@@ -115,7 +132,7 @@ index 748003e..b1d3a60 100644
  	if err != nil {
  		return nil, fmt.Errorf("failed configure server: %w", err)
  	}
-@@ -194,7 +204,7 @@ func RunSSServer(filename string, natTimeout time.Duration, sm *outlineMetrics,
+@@ -194,7 +213,7 @@ func RunSSServer(filename string, natTimeout time.Duration, sm *outlineMetrics,
  	go func() {
  		for range sigHup {
  			logger.Infof("SIGHUP received. Loading config from %v", filename)
@@ -124,7 +141,7 @@ index 748003e..b1d3a60 100644
  				logger.Errorf("Failed to update server: %v. Server state may be invalid. Fix the error and try the update again", err)
  			}
  		}
-@@ -203,12 +213,15 @@ func RunSSServer(filename string, natTimeout time.Duration, sm *outlineMetrics,
+@@ -203,11 +222,13 @@ func RunSSServer(filename string, natTimeout time.Duration, sm *outlineMetrics,
  }
  
  type Config struct {
@@ -133,20 +150,17 @@ index 748003e..b1d3a60 100644
 -		Port   int
 -		Cipher string
 -		Secret string
--	}
-+	BindAddress string `yaml:"bind_address"`
++	BindAddress string
 +	Keys        []struct {
-+		ID        string `yaml:"id"`
-+		Port      int    `yaml:"port"`
-+		Cipher    string `yaml:"cipher"`
-+		Secret    string `yaml:"secret"`
-+		RecvLimit int    `yaml:"recv_limit"`
-+		SendLimit int    `yaml:"send_limit"`
-+	} `yaml:"keys"`
++		ID        string
++		Port      int
++		Cipher    string
++		Secret    string
++		RateLimit int
+ 	}
  }
  
- func readConfig(filename string) (*Config, error) {
-@@ -230,6 +243,7 @@ func main() {
+@@ -230,6 +251,7 @@ func main() {
  		MetricsAddr   string
  		IPCountryDB   string
  		IPASNDB       string
@@ -154,7 +168,7 @@ index 748003e..b1d3a60 100644
  		natTimeout    time.Duration
  		replayHistory int
  		Verbose       bool
-@@ -244,6 +258,8 @@ func main() {
+@@ -244,6 +266,8 @@ func main() {
  	flag.BoolVar(&flags.Verbose, "verbose", false, "Enables verbose logging output")
  	flag.BoolVar(&flags.Version, "version", false, "The version of the server")
  
@@ -163,7 +177,7 @@ index 748003e..b1d3a60 100644
  	flag.Parse()
  
  	if flags.Verbose {
-@@ -285,7 +301,7 @@ func main() {
+@@ -285,7 +309,7 @@ func main() {
  
  	m := newPrometheusOutlineMetrics(ip2info, prometheus.DefaultRegisterer)
  	m.SetBuildInfo(version)
@@ -186,19 +200,31 @@ index 0b7777b..e41f693 100644
  		t.Fatalf("RunSSServer() error = %v", err)
  	}
 diff --git a/internal/integration_test/integration_test.go b/internal/integration_test/integration_test.go
-index ecb5ee2..a9366c7 100644
+index ecb5ee2..68b7c48 100644
 --- a/internal/integration_test/integration_test.go
 +++ b/internal/integration_test/integration_test.go
-@@ -107,7 +107,7 @@ func TestTCPEcho(t *testing.T) {
- 		t.Fatalf("ListenTCP failed: %v", err)
+@@ -99,6 +99,11 @@ func startUDPEchoServer(t testing.TB) (*net.UDPConn, *sync.WaitGroup) {
+ 	return conn, &running
+ }
+ 
++func makeLimiter(cipherList service.CipherList) service.TrafficLimiter {
++	c := service.MakeTestTrafficLimiterConfig(cipherList)
++	return service.NewTrafficLimiter(&c)
++}
++
+ func TestTCPEcho(t *testing.T) {
+ 	echoListener, echoRunning := startTCPEchoServer(t)
+ 
+@@ -113,7 +118,7 @@ func TestTCPEcho(t *testing.T) {
  	}
- 	secrets := []string{"secret"}
--	cipherList, err := service.MakeTestCiphers(secrets)
-+	cipherList, err := service.MakeTestCiphers(secrets, 0, 0)
- 	if err != nil {
- 		t.Fatal(err)
- 	}
-@@ -161,6 +161,169 @@ func TestTCPEcho(t *testing.T) {
+ 	replayCache := service.NewReplayCache(5)
+ 	const testTimeout = 200 * time.Millisecond
+-	handler := service.NewTCPHandler(proxyListener.Addr().(*net.TCPAddr).Port, cipherList, &replayCache, &service.NoOpTCPMetrics{}, testTimeout)
++	handler := service.NewTCPHandler(proxyListener.Addr().(*net.TCPAddr).Port, cipherList, &replayCache, &service.NoOpTCPMetrics{}, testTimeout, makeLimiter(cipherList))
+ 	handler.SetTargetIPValidator(allowAll)
+ 	done := make(chan struct{})
+ 	go func() {
+@@ -161,6 +166,183 @@ func TestTCPEcho(t *testing.T) {
  	echoRunning.Wait()
  }
  
@@ -210,14 +236,21 @@ index ecb5ee2..a9366c7 100644
 +		t.Fatalf("ListenTCP failed: %v", err)
 +	}
 +	secrets := sstest.MakeTestSecrets(1)
-+	cipherList, err := service.MakeTestCiphers(secrets, 1000, 1000)
++	cipherList, err := service.MakeTestCiphers(secrets)
 +	if err != nil {
 +		t.Fatal(err)
 +	}
 +	replayCache := service.NewReplayCache(5)
 +	const testTimeout = 5 * time.Second
 +
-+	handler := service.NewTCPHandler(proxyListener.Addr().(*net.TCPAddr).Port, cipherList, &replayCache, &service.NoOpTCPMetrics{}, testTimeout)
++	key := cipherList.SnapshotForClientIP(net.IP{})[0].Value.(*service.CipherEntry).ID
++	trafficLimiter := service.NewTrafficLimiter(&service.TrafficLimiterConfig{
++		KeyToRateLimit: map[string]int{
++			key: 1000,
++		},
++	})
++
++	handler := service.NewTCPHandler(proxyListener.Addr().(*net.TCPAddr).Port, cipherList, &replayCache, &service.NoOpTCPMetrics{}, testTimeout, trafficLimiter)
 +	handler.SetTargetIPValidator(allowAll)
 +	done := make(chan struct{})
 +	go func() {
@@ -295,13 +328,20 @@ index ecb5ee2..a9366c7 100644
 +		t.Fatalf("ListenTCP failed: %v", err)
 +	}
 +	secrets := sstest.MakeTestSecrets(1)
-+	cipherList, err := service.MakeTestCiphers(secrets, 1000, 1000)
++	cipherList, err := service.MakeTestCiphers(secrets)
 +	if err != nil {
 +		t.Fatal(err)
 +	}
 +
++	key := cipherList.SnapshotForClientIP(net.IP{})[0].Value.(*service.CipherEntry).ID
++	trafficLimiter := service.NewTrafficLimiter(&service.TrafficLimiterConfig{
++		KeyToRateLimit: map[string]int{
++			key: 1000,
++		},
++	})
++
 +	testMetrics := &fakeUDPMetrics{}
-+	proxy := service.NewPacketHandler(time.Hour, cipherList, testMetrics)
++	proxy := service.NewPacketHandler(time.Hour, cipherList, testMetrics, trafficLimiter)
 +	proxy.SetTargetIPValidator(allowAll)
 +	done := make(chan struct{})
 +	go func() {
@@ -368,16 +408,16 @@ index ecb5ee2..a9366c7 100644
  type statusMetrics struct {
  	service.NoOpTCPMetrics
  	sync.Mutex
-@@ -177,7 +340,7 @@ func TestRestrictedAddresses(t *testing.T) {
- 	proxyListener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
- 	require.NoError(t, err, "ListenTCP failed: %v", err)
- 	secrets := []string{"secret"}
--	cipherList, err := service.MakeTestCiphers(secrets)
-+	cipherList, err := service.MakeTestCiphers(secrets, 0, 0)
+@@ -181,7 +363,7 @@ func TestRestrictedAddresses(t *testing.T) {
  	require.NoError(t, err)
  	const testTimeout = 200 * time.Millisecond
  	testMetrics := &statusMetrics{}
-@@ -241,15 +404,19 @@ var _ service.UDPMetrics = (*fakeUDPMetrics)(nil)
+-	handler := service.NewTCPHandler(proxyListener.Addr().(*net.TCPAddr).Port, cipherList, nil, testMetrics, testTimeout)
++	handler := service.NewTCPHandler(proxyListener.Addr().(*net.TCPAddr).Port, cipherList, nil, testMetrics, testTimeout, makeLimiter(cipherList))
+ 	done := make(chan struct{})
+ 	go func() {
+ 		service.StreamServe(service.WrapStreamListener(proxyListener.AcceptTCP), handler.Handle)
+@@ -241,15 +423,19 @@ var _ service.UDPMetrics = (*fakeUDPMetrics)(nil)
  func (m *fakeUDPMetrics) GetIPInfo(ip net.IP) (ipinfo.IPInfo, error) {
  	return ipinfo.IPInfo{CountryCode: "QQ"}, nil
  }
@@ -397,140 +437,57 @@ index ecb5ee2..a9366c7 100644
  func (m *fakeUDPMetrics) RemoveUDPNatEntry() {
  	// Not tested because it requires waiting for a long timeout.
  }
-@@ -263,7 +430,7 @@ func TestUDPEcho(t *testing.T) {
- 		t.Fatalf("ListenTCP failed: %v", err)
- 	}
- 	secrets := []string{"secret"}
--	cipherList, err := service.MakeTestCiphers(secrets)
-+	cipherList, err := service.MakeTestCiphers(secrets, 0, 0)
- 	if err != nil {
+@@ -268,7 +454,7 @@ func TestUDPEcho(t *testing.T) {
  		t.Fatal(err)
  	}
-@@ -356,7 +523,7 @@ func BenchmarkTCPThroughput(b *testing.B) {
- 		b.Fatalf("ListenTCP failed: %v", err)
+ 	testMetrics := &fakeUDPMetrics{}
+-	proxy := service.NewPacketHandler(time.Hour, cipherList, testMetrics)
++	proxy := service.NewPacketHandler(time.Hour, cipherList, testMetrics, makeLimiter(cipherList))
+ 	proxy.SetTargetIPValidator(allowAll)
+ 	done := make(chan struct{})
+ 	go func() {
+@@ -361,7 +547,7 @@ func BenchmarkTCPThroughput(b *testing.B) {
+ 		b.Fatal(err)
  	}
- 	secrets := []string{"secret"}
--	cipherList, err := service.MakeTestCiphers(secrets)
-+	cipherList, err := service.MakeTestCiphers(secrets, 0, 0)
+ 	const testTimeout = 200 * time.Millisecond
+-	handler := service.NewTCPHandler(proxyListener.Addr().(*net.TCPAddr).Port, cipherList, nil, &service.NoOpTCPMetrics{}, testTimeout)
++	handler := service.NewTCPHandler(proxyListener.Addr().(*net.TCPAddr).Port, cipherList, nil, &service.NoOpTCPMetrics{}, testTimeout, makeLimiter(cipherList))
+ 	handler.SetTargetIPValidator(allowAll)
+ 	done := make(chan struct{})
+ 	go func() {
+@@ -423,7 +609,7 @@ func BenchmarkTCPMultiplexing(b *testing.B) {
+ 	}
+ 	replayCache := service.NewReplayCache(service.MaxCapacity)
+ 	const testTimeout = 200 * time.Millisecond
+-	handler := service.NewTCPHandler(proxyListener.Addr().(*net.TCPAddr).Port, cipherList, &replayCache, &service.NoOpTCPMetrics{}, testTimeout)
++	handler := service.NewTCPHandler(proxyListener.Addr().(*net.TCPAddr).Port, cipherList, &replayCache, &service.NoOpTCPMetrics{}, testTimeout, makeLimiter(cipherList))
+ 	handler.SetTargetIPValidator(allowAll)
+ 	done := make(chan struct{})
+ 	go func() {
+@@ -496,7 +682,7 @@ func BenchmarkUDPEcho(b *testing.B) {
  	if err != nil {
  		b.Fatal(err)
  	}
-@@ -417,7 +584,7 @@ func BenchmarkTCPMultiplexing(b *testing.B) {
- 	}
- 	const numKeys = 50
- 	secrets := sstest.MakeTestSecrets(numKeys)
--	cipherList, err := service.MakeTestCiphers(secrets)
-+	cipherList, err := service.MakeTestCiphers(secrets, 0, 0)
+-	proxy := service.NewPacketHandler(time.Hour, cipherList, &service.NoOpUDPMetrics{})
++	proxy := service.NewPacketHandler(time.Hour, cipherList, &service.NoOpUDPMetrics{}, makeLimiter(cipherList))
+ 	proxy.SetTargetIPValidator(allowAll)
+ 	done := make(chan struct{})
+ 	go func() {
+@@ -540,7 +726,7 @@ func BenchmarkUDPManyKeys(b *testing.B) {
  	if err != nil {
  		b.Fatal(err)
  	}
-@@ -492,7 +659,7 @@ func BenchmarkUDPEcho(b *testing.B) {
- 		b.Fatalf("ListenTCP failed: %v", err)
- 	}
- 	secrets := []string{"secret"}
--	cipherList, err := service.MakeTestCiphers(secrets)
-+	cipherList, err := service.MakeTestCiphers(secrets, 0, 0)
- 	if err != nil {
- 		b.Fatal(err)
- 	}
-@@ -536,7 +703,7 @@ func BenchmarkUDPManyKeys(b *testing.B) {
- 	}
- 	const numKeys = 100
- 	secrets := sstest.MakeTestSecrets(numKeys)
--	cipherList, err := service.MakeTestCiphers(secrets)
-+	cipherList, err := service.MakeTestCiphers(secrets, 0, 0)
- 	if err != nil {
- 		b.Fatal(err)
- 	}
-diff --git a/service/cipher_list.go b/service/cipher_list.go
-index cadcc40..3794303 100644
---- a/service/cipher_list.go
-+++ b/service/cipher_list.go
-@@ -28,14 +28,15 @@ const minSaltEntropy = 16
- // CipherEntry holds a Cipher with an identifier.
- // The public fields are constant, but lastClientIP is mutable under cipherList.mu.
- type CipherEntry struct {
--	ID            string
--	CryptoKey     *shadowsocks.EncryptionKey
--	SaltGenerator ServerSaltGenerator
--	lastClientIP  net.IP
-+	ID             string
-+	CryptoKey      *shadowsocks.EncryptionKey
-+	SaltGenerator  ServerSaltGenerator
-+	TrafficLimiter TrafficLimiter
-+	lastClientIP   net.IP
- }
- 
- // MakeCipherEntry constructs a CipherEntry.
--func MakeCipherEntry(id string, cryptoKey *shadowsocks.EncryptionKey, secret string) CipherEntry {
-+func MakeCipherEntry(id string, cryptoKey *shadowsocks.EncryptionKey, secret string, limiter TrafficLimiter) CipherEntry {
- 	var saltGenerator ServerSaltGenerator
- 	if cryptoKey.SaltSize()-serverSaltMarkLen >= minSaltEntropy {
- 		// Mark salts with a tag for reverse replay protection.
-@@ -46,9 +47,10 @@ func MakeCipherEntry(id string, cryptoKey *shadowsocks.EncryptionKey, secret str
- 		saltGenerator = RandomServerSaltGenerator
- 	}
- 	return CipherEntry{
--		ID:            id,
--		CryptoKey:     cryptoKey,
--		SaltGenerator: saltGenerator,
-+		ID:             id,
-+		CryptoKey:      cryptoKey,
-+		SaltGenerator:  saltGenerator,
-+		TrafficLimiter: limiter,
- 	}
- }
- 
-diff --git a/service/cipher_list_test.go b/service/cipher_list_test.go
-index 72a852c..11cd1ea 100644
---- a/service/cipher_list_test.go
-+++ b/service/cipher_list_test.go
-@@ -25,7 +25,7 @@ import (
- func BenchmarkLocking(b *testing.B) {
- 	var ip net.IP
- 
--	ciphers, _ := MakeTestCiphers([]string{"secret"})
-+	ciphers, _ := MakeTestCiphers([]string{"secret"}, 0, 0)
- 	b.ResetTimer()
- 	b.RunParallel(func(pb *testing.PB) {
- 		for pb.Next() {
-@@ -41,7 +41,7 @@ func BenchmarkSnapshot(b *testing.B) {
- 	// Small cipher lists (N~1e3) fit entirely in cache, and are ~10 times
- 	// faster to copy (per entry) than very large cipher lists (N~1e5).
- 	const N = 1e3
--	ciphers, _ := MakeTestCiphers(sstest.MakeTestSecrets(N))
-+	ciphers, _ := MakeTestCiphers(sstest.MakeTestSecrets(N), 0, 0)
- 
- 	// Shuffling simulates the behavior of a real server, where successive
- 	// ciphers are not expected to be nearby in memory.
-diff --git a/service/cipher_list_testing.go b/service/cipher_list_testing.go
-index a77427e..dcba9b2 100644
---- a/service/cipher_list_testing.go
-+++ b/service/cipher_list_testing.go
-@@ -23,7 +23,7 @@ import (
- 
- // MakeTestCiphers creates a CipherList containing one fresh AEAD cipher
- // for each secret in `secrets`.
--func MakeTestCiphers(secrets []string) (CipherList, error) {
-+func MakeTestCiphers(secrets []string, rx, tx int) (CipherList, error) {
- 	l := list.New()
- 	for i := 0; i < len(secrets); i++ {
- 		cipherID := fmt.Sprintf("id-%v", i)
-@@ -31,7 +31,7 @@ func MakeTestCiphers(secrets []string) (CipherList, error) {
- 		if err != nil {
- 			return nil, fmt.Errorf("failed to create cipher %v: %w", i, err)
- 		}
--		entry := MakeCipherEntry(cipherID, cipher, secrets[i])
-+		entry := MakeCipherEntry(cipherID, cipher, secrets[i], NewTrafficLimiter(rx, tx))
- 		l.PushBack(&entry)
- 	}
- 	cipherList := NewCipherList()
+-	proxy := service.NewPacketHandler(time.Hour, cipherList, &service.NoOpUDPMetrics{})
++	proxy := service.NewPacketHandler(time.Hour, cipherList, &service.NoOpUDPMetrics{}, makeLimiter(cipherList))
+ 	proxy.SetTargetIPValidator(allowAll)
+ 	done := make(chan struct{})
+ 	go func() {
 diff --git a/service/limiter.go b/service/limiter.go
 new file mode 100644
-index 0000000..5f74d8b
+index 0000000..c8a1408
 --- /dev/null
 +++ b/service/limiter.go
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,128 @@
 +// Copyright 2018 Jigsaw Operations LLC
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -555,31 +512,33 @@ index 0000000..5f74d8b
 +	"golang.org/x/time/rate"
 +)
 +
-+type TrafficLimiter interface {
-+	WrapReaderWriter(reader io.Reader, writer io.Writer) (io.Reader, io.Writer)
-+	AllowRecv(n int) bool
-+	AllowSend(n int) bool
++type TrafficLimiterConfig struct {
++	// Rate limit in bytes per second.
++	// If the corresponding limit is zero, it means no limits
++	KeyToRateLimit map[string]int
 +}
 +
-+func NewTrafficLimiter(recv_limit, send_limit int) *trafficLimiter {
-+	var recv_limiter *rate.Limiter
-+	if recv_limit == 0 {
-+		recv_limiter = nil
-+	} else {
-+		recv_limiter = createLimiter(recv_limit)
++type TrafficLimiter interface {
++	WrapReaderWriter(accessKey string, reader io.Reader, writer io.Writer) (io.Reader, io.Writer)
++	Allow(accessKey string, n int) bool
++}
++
++func NewTrafficLimiter(config *TrafficLimiterConfig) TrafficLimiter {
++	keyToLimiter := make(map[string]*rate.Limiter, len(config.KeyToRateLimit))
++	for accessKey, limit := range config.KeyToRateLimit {
++		var limiter *rate.Limiter
++		if limit == 0 {
++			limiter = nil
++		} else {
++			limiter = createLimiter(limit)
++		}
++		keyToLimiter[accessKey] = limiter
 +	}
-+	var send_limiter *rate.Limiter
-+	if send_limit == 0 {
-+		send_limiter = nil
-+	} else {
-+		send_limiter = createLimiter(send_limit)
-+	}
-+	return &trafficLimiter{recv_limiter: recv_limiter, send_limiter: send_limiter}
++	return &trafficLimiter{keyToLimiter: keyToLimiter}
 +}
 +
 +type trafficLimiter struct {
-+	recv_limiter *rate.Limiter
-+	send_limiter *rate.Limiter
++	keyToLimiter map[string]*rate.Limiter
 +}
 +
 +// doWait does the waiting for any n, even exceeding the burst limit.
@@ -636,39 +595,33 @@ index 0000000..5f74d8b
 +	return rate.NewLimiter(theRate, burst)
 +}
 +
-+func (l *trafficLimiter) WrapReaderWriter(reader io.Reader, writer io.Writer) (io.Reader, io.Writer) {
-+	if l.recv_limiter == nil && l.send_limiter == nil {
++func (l *trafficLimiter) WrapReaderWriter(accessKey string, reader io.Reader, writer io.Writer) (io.Reader, io.Writer) {
++	limiter, ok := l.keyToLimiter[accessKey]
++	if !ok {
++		logger.Panicf("Access key %v not found", accessKey)
++	}
++	if limiter == nil {
 +		return reader, writer
 +	}
-+	if l.recv_limiter == nil {
-+		return &limitedReader{reader: reader, limiter: l.recv_limiter}, writer
-+	}
-+	if l.send_limiter == nil {
-+		return reader, &limitedWriter{writer: writer, limiter: l.send_limiter}
-+	}
-+
-+	return &limitedReader{reader: reader, limiter: l.recv_limiter}, &limitedWriter{writer: writer, limiter: l.send_limiter}
++	return &limitedReader{reader: reader, limiter: limiter}, &limitedWriter{writer: writer, limiter: limiter}
 +}
 +
-+func (l *trafficLimiter) AllowRecv(n int) bool {
-+	if l.recv_limiter == nil {
++func (l *trafficLimiter) Allow(accessKey string, n int) bool {
++	limiter, ok := l.keyToLimiter[accessKey]
++	if !ok {
++		logger.Panicf("Access key %v not found", accessKey)
++	}
++	if limiter == nil {
 +		return true
 +	}
-+	return l.recv_limiter.AllowN(time.Now(), n)
-+}
-+
-+func (l *trafficLimiter) AllowSend(n int) bool {
-+	if l.send_limiter == nil {
-+		return true
-+	}
-+	return l.send_limiter.AllowN(time.Now(), n)
++	return limiter.AllowN(time.Now(), n)
 +}
 diff --git a/service/limiter_test.go b/service/limiter_test.go
 new file mode 100644
-index 0000000..c825488
+index 0000000..e27eaa8
 --- /dev/null
 +++ b/service/limiter_test.go
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,121 @@
 +// Copyright 2020 Jigsaw Operations LLC
 +//
 +// Licensed under the Apache License, Version 2.0 (the "License");
@@ -687,8 +640,8 @@ index 0000000..c825488
 +
 +import (
 +	"bytes"
-+	"crypto/rand"
 +	"io"
++	"math/rand"
 +	"testing"
 +	"time"
 +
@@ -702,9 +655,19 @@ index 0000000..c825488
 +}
 +
 +func TestTrafficLimiter(t *testing.T) {
-+	lim1 := NewTrafficLimiter(20, 20)
-+	lim2 := NewTrafficLimiter(30, 30)
-+	lim3 := NewTrafficLimiter(0, 0)
++	key1 := "key1"
++	key2 := "key2"
++	key3 := "key3"
++
++	config := TrafficLimiterConfig{
++		KeyToRateLimit: map[string]int{
++			key1: 20,
++			key2: 30,
++			key3: 0,
++		},
++	}
++
++	limiter := NewTrafficLimiter(&config)
 +
 +	src1Buf := makeRandBuffer(100)
 +	src1 := src1Buf.Bytes()
@@ -718,9 +681,9 @@ index 0000000..c825488
 +	src3 := src3Buf.Bytes()
 +	dst3 := &bytes.Buffer{}
 +
-+	r1, w1 := lim1.WrapReaderWriter(src1Buf, dst1)
-+	r2, w2 := lim2.WrapReaderWriter(src2Buf, dst2)
-+	r3, w3 := lim3.WrapReaderWriter(src3Buf, dst3)
++	r1, w1 := limiter.WrapReaderWriter(key1, src1Buf, dst1)
++	r2, w2 := limiter.WrapReaderWriter(key2, src2Buf, dst2)
++	r3, w3 := limiter.WrapReaderWriter(key3, src3Buf, dst3)
 +
 +	doRead := func(buf []byte, r io.Reader, n int) time.Duration {
 +		b := make([]byte, n)
@@ -728,32 +691,23 @@ index 0000000..c825488
 +		_, err := io.ReadFull(r, b)
 +		require.NoError(t, err)
 +		require.Equal(t, b, buf[:len(b)])
-+		return time.Since(start)
++		return time.Now().Sub(start)
 +	}
 +
 +	period1 := doRead(src1, r1, 20)
 +	if period1 > 10*time.Millisecond {
-+		t.Errorf("read took too long: %s", period1)
++		t.Errorf("read took too long")
 +	}
 +
-+	allowed := lim2.AllowRecv(10)
-+	require.True(t, allowed)
-+
-+	period2 := doRead(src2, r2, 70)
-+	if period2 < time.Second {
-+		t.Errorf("read took too short: %s", period2)
++	period2 := doRead(src2, r2, 30)
++	if period2 > 10*time.Millisecond {
++		t.Errorf("read took too long")
 +	}
-+
-+	allowed = lim2.AllowRecv(10)
-+	require.False(t, allowed)
 +
 +	period3 := doRead(src3, r3, 100)
 +	if period3 > 10*time.Millisecond {
-+		t.Errorf("read took too long: %s", period3)
++		t.Errorf("read took too long")
 +	}
-+
-+	allowed = lim3.AllowRecv(100)
-+	require.True(t, allowed)
 +
 +	doWrite := func(buf []byte, dst *bytes.Buffer, w io.Writer) time.Duration {
 +		start := time.Now()
@@ -761,65 +715,113 @@ index 0000000..c825488
 +		_, err := w.Write(buf)
 +		require.NoError(t, err)
 +		require.Equal(t, buf, dst.Bytes()[:size])
-+		return time.Since(start)
++		return time.Now().Sub(start)
 +	}
 +
 +	// Waiting works even for payload exceeding one second burst.
 +	period4 := doWrite(src1[:30], dst1, w1)
 +	if period4 < 500*time.Millisecond {
-+		t.Fatalf("write took too short: %s", period4)
++		t.Fatalf("write took too short")
 +	}
 +
-+	allowed = lim2.AllowSend(20)
++	allowed := limiter.Allow(key2, 30)
 +	require.True(t, allowed)
 +
-+	allowed = lim2.AllowSend(20)
++	allowed = limiter.Allow(key2, 10)
 +	require.False(t, allowed)
 +
 +	period5 := doWrite(src2[:30], dst2, w2)
 +	if period5 < 500*time.Millisecond {
-+		t.Fatalf("write took too short: %s", period5)
++		t.Fatalf("write took too short")
 +	}
 +
-+	allowed = lim3.AllowSend(1000)
++	allowed = limiter.Allow(key3, 1000)
 +	require.True(t, allowed)
 +
 +	period6 := doWrite(src3[:100], dst3, w3)
 +	if period6 > 10*time.Millisecond {
-+		t.Fatalf("write took too long: %s", period6)
++		t.Fatalf("write took too long")
 +	}
 +}
+diff --git a/service/limiter_testing.go b/service/limiter_testing.go
+new file mode 100644
+index 0000000..081d7a2
+--- /dev/null
++++ b/service/limiter_testing.go
+@@ -0,0 +1,29 @@
++// Copyright 2018 Jigsaw Operations LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package service
++
++import (
++	"net"
++)
++
++func MakeTestTrafficLimiterConfig(ciphers CipherList) TrafficLimiterConfig {
++	elts := ciphers.SnapshotForClientIP(net.IP{})
++	keyToLimit := make(map[string]int)
++	for _, elt := range elts {
++		entry := elt.Value.(*CipherEntry)
++		keyToLimit[entry.ID] = 0
++	}
++	return TrafficLimiterConfig{KeyToRateLimit: keyToLimit}
++}
 diff --git a/service/tcp.go b/service/tcp.go
-index d295931..46b5259 100644
+index d295931..cfd68fc 100644
 --- a/service/tcp.go
 +++ b/service/tcp.go
-@@ -130,7 +130,9 @@ type tcpHandler struct {
+@@ -126,16 +126,20 @@ type tcpHandler struct {
+ 	// `replayCache` is a pointer to SSServer.replayCache, to share the cache among all ports.
+ 	replayCache       *ReplayCache
+ 	targetIPValidator onet.TargetIPValidator
++	limiter           TrafficLimiter
+ }
  
  // NewTCPService creates a TCPService
  // `replayCache` is a pointer to SSServer.replayCache, to share the cache among all ports.
 -func NewTCPHandler(port int, ciphers CipherList, replayCache *ReplayCache, m TCPMetrics, timeout time.Duration) TCPHandler {
 +func NewTCPHandler(port int, ciphers CipherList, replayCache *ReplayCache, m TCPMetrics,
-+	timeout time.Duration,
++	timeout time.Duration, limiter TrafficLimiter,
 +) TCPHandler {
  	return &tcpHandler{
  		port:              port,
  		ciphers:           ciphers,
-@@ -252,9 +254,13 @@ func (h *tcpHandler) handleConnection(listenerPort int, clientConn transport.Str
+ 		m:                 m,
+ 		readTimeout:       timeout,
++		limiter:           limiter,
+ 		replayCache:       replayCache,
+ 		targetIPValidator: onet.RequirePublicIP,
+ 	}
+@@ -252,9 +256,15 @@ func (h *tcpHandler) handleConnection(listenerPort int, clientConn transport.Str
  		h.absorbProbe(listenerPort, clientConn, status, proxyMetrics)
  		return "", onet.NewConnectionError(status, "Failed to find a valid cipher", keyErr)
  	}
 -	var id string
 +	var (
 +		id           string
++		accessKey    string
 +		clientWriter io.Writer = clientConn
 +	)
  	if cipherEntry != nil {
  		id = cipherEntry.ID
-+		clientReader, clientWriter = cipherEntry.TrafficLimiter.WrapReaderWriter(clientReader, clientWriter)
++		accessKey = cipherEntry.ID
++		clientReader, clientWriter = h.limiter.WrapReaderWriter(accessKey, clientReader, clientWriter)
  	}
  
  	// 2. Check if the connection is a replay.
-@@ -279,9 +285,10 @@ func (h *tcpHandler) handleConnection(listenerPort int, clientConn transport.Str
+@@ -279,9 +289,10 @@ func (h *tcpHandler) handleConnection(listenerPort int, clientConn transport.Str
  	clientConn.SetReadDeadline(time.Time{})
  	if err != nil {
  		// Drain to prevent a close on cipher error.
@@ -831,7 +833,7 @@ index d295931..46b5259 100644
  	tgtConn, dialErr := dialTarget(tgtAddr, proxyMetrics, h.targetIPValidator)
  	if dialErr != nil {
  		// We don't drain so dial errors and invalid addresses are communicated quickly.
-@@ -291,15 +298,16 @@ func (h *tcpHandler) handleConnection(listenerPort int, clientConn transport.Str
+@@ -291,15 +302,16 @@ func (h *tcpHandler) handleConnection(listenerPort int, clientConn transport.Str
  
  	// 4. Bridge the client and target connections
  	logger.Debugf("proxy %s <-> %s", clientConn.RemoteAddr().String(), tgtConn.RemoteAddr().String())
@@ -850,7 +852,7 @@ index d295931..46b5259 100644
  		}
  		clientConn.CloseRead()
  		// Send FIN to target.
-@@ -353,6 +361,7 @@ var _ TCPMetrics = (*NoOpTCPMetrics)(nil)
+@@ -353,6 +365,7 @@ var _ TCPMetrics = (*NoOpTCPMetrics)(nil)
  
  func (m *NoOpTCPMetrics) AddClosedTCPConnection(clientInfo ipinfo.IPInfo, accessKey, status string, data metrics.ProxyMetrics, duration time.Duration) {
  }
@@ -859,27 +861,9 @@ index d295931..46b5259 100644
  	return ipinfo.IPInfo{}, nil
  }
 diff --git a/service/tcp_test.go b/service/tcp_test.go
-index 1f38111..b6062bf 100644
+index 1f38111..5274f32 100644
 --- a/service/tcp_test.go
 +++ b/service/tcp_test.go
-@@ -84,7 +84,7 @@ func BenchmarkTCPFindCipherFail(b *testing.B) {
- 		b.Fatalf("ListenTCP failed: %v", err)
- 	}
- 
--	cipherList, err := MakeTestCiphers(makeTestSecrets(100))
-+	cipherList, err := MakeTestCiphers(makeTestSecrets(100), 0, 0)
- 	if err != nil {
- 		b.Fatal(err)
- 	}
-@@ -187,7 +187,7 @@ func BenchmarkTCPFindCipherRepeat(b *testing.B) {
- 	b.ResetTimer()
- 
- 	const numCiphers = 100 // Must be <256
--	cipherList, err := MakeTestCiphers(makeTestSecrets(numCiphers))
-+	cipherList, err := MakeTestCiphers(makeTestSecrets(numCiphers), 0, 0)
- 	if err != nil {
- 		b.Fatal(err)
- 	}
 @@ -233,8 +233,10 @@ func (m *probeTestMetrics) AddClosedTCPConnection(clientInfo ipinfo.IPInfo, acce
  func (m *probeTestMetrics) GetIPInfo(net.IP) (ipinfo.IPInfo, error) {
  	return ipinfo.IPInfo{}, nil
@@ -891,162 +875,127 @@ index 1f38111..b6062bf 100644
  func (m *probeTestMetrics) AddTCPProbe(status, drainResult string, port int, clientProxyBytes int64) {
  	m.mu.Lock()
  	m.probeData = append(m.probeData, clientProxyBytes)
-@@ -273,7 +275,7 @@ func probe(serverAddr *net.TCPAddr, bytesToSend []byte) error {
- 
- func TestProbeRandom(t *testing.T) {
- 	listener := makeLocalhostListener(t)
--	cipherList, err := MakeTestCiphers(makeTestSecrets(1))
-+	cipherList, err := MakeTestCiphers(makeTestSecrets(1), 0, 0)
- 	require.NoError(t, err, "MakeTestCiphers failed: %v", err)
- 	testMetrics := &probeTestMetrics{}
- 	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, nil, testMetrics, 200*time.Millisecond)
-@@ -348,7 +350,7 @@ func firstCipher(cipherList CipherList) *shadowsocks.EncryptionKey {
- 
- func TestProbeClientBytesBasicTruncated(t *testing.T) {
- 	listener := makeLocalhostListener(t)
--	cipherList, err := MakeTestCiphers(makeTestSecrets(1))
-+	cipherList, err := MakeTestCiphers(makeTestSecrets(1), 0, 0)
- 	require.NoError(t, err, "MakeTestCiphers failed: %v", err)
- 	cipher := firstCipher(cipherList)
- 	testMetrics := &probeTestMetrics{}
-@@ -383,7 +385,7 @@ func TestProbeClientBytesBasicTruncated(t *testing.T) {
- 
- func TestProbeClientBytesBasicModified(t *testing.T) {
- 	listener := makeLocalhostListener(t)
--	cipherList, err := MakeTestCiphers(makeTestSecrets(1))
-+	cipherList, err := MakeTestCiphers(makeTestSecrets(1), 0, 0)
- 	require.NoError(t, err, "MakeTestCiphers failed: %v", err)
- 	cipher := firstCipher(cipherList)
- 	testMetrics := &probeTestMetrics{}
-@@ -419,7 +421,7 @@ func TestProbeClientBytesBasicModified(t *testing.T) {
- 
- func TestProbeClientBytesCoalescedModified(t *testing.T) {
- 	listener := makeLocalhostListener(t)
--	cipherList, err := MakeTestCiphers(makeTestSecrets(1))
-+	cipherList, err := MakeTestCiphers(makeTestSecrets(1), 0, 0)
- 	require.NoError(t, err, "MakeTestCiphers failed: %v", err)
- 	cipher := firstCipher(cipherList)
- 	testMetrics := &probeTestMetrics{}
-@@ -462,7 +464,7 @@ func makeServerBytes(t *testing.T, cryptoKey *shadowsocks.EncryptionKey) []byte
- 
- func TestProbeServerBytesModified(t *testing.T) {
- 	listener := makeLocalhostListener(t)
--	cipherList, err := MakeTestCiphers(makeTestSecrets(1))
-+	cipherList, err := MakeTestCiphers(makeTestSecrets(1), 0, 0)
- 	require.NoError(t, err, "MakeTestCiphers failed: %v", err)
- 	cipher := firstCipher(cipherList)
- 	testMetrics := &probeTestMetrics{}
-@@ -491,7 +493,7 @@ func TestProbeServerBytesModified(t *testing.T) {
- 
- func TestReplayDefense(t *testing.T) {
- 	listener := makeLocalhostListener(t)
--	cipherList, err := MakeTestCiphers(makeTestSecrets(1))
-+	cipherList, err := MakeTestCiphers(makeTestSecrets(1), 0, 0)
- 	require.NoError(t, err, "MakeTestCiphers failed: %v", err)
- 	replayCache := NewReplayCache(5)
- 	testMetrics := &probeTestMetrics{}
-@@ -569,7 +571,7 @@ func TestReplayDefense(t *testing.T) {
- 
- func TestReverseReplayDefense(t *testing.T) {
- 	listener := makeLocalhostListener(t)
--	cipherList, err := MakeTestCiphers(makeTestSecrets(1))
-+	cipherList, err := MakeTestCiphers(makeTestSecrets(1), 0, 0)
- 	require.NoError(t, err, "MakeTestCiphers failed: %v", err)
- 	replayCache := NewReplayCache(5)
- 	testMetrics := &probeTestMetrics{}
-@@ -641,7 +643,7 @@ func probeExpectTimeout(t *testing.T, payloadSize int) {
- 	const testTimeout = 200 * time.Millisecond
- 
- 	listener := makeLocalhostListener(t)
--	cipherList, err := MakeTestCiphers(makeTestSecrets(5))
-+	cipherList, err := MakeTestCiphers(makeTestSecrets(5), 0, 0)
- 	require.NoError(t, err, "MakeTestCiphers failed: %v", err)
- 	testMetrics := &probeTestMetrics{}
- 	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, nil, testMetrics, testTimeout)
-diff --git a/service/udp.go b/service/udp.go
-index 4138ed8..c2bd9a1 100644
---- a/service/udp.go
-+++ b/service/udp.go
-@@ -64,12 +64,13 @@ func debugUDPAddr(addr net.Addr, template string, val interface{}) {
- 
- // Decrypts src into dst. It tries each cipher until it finds one that authenticates
- // correctly. dst and src must not overlap.
--func findAccessKeyUDP(clientIP net.IP, dst, src []byte, cipherList CipherList) ([]byte, string, *shadowsocks.EncryptionKey, error) {
-+func findAccessKeyUDP(clientIP net.IP, dst, src []byte, cipherList CipherList) ([]byte, string, *shadowsocks.EncryptionKey, TrafficLimiter, error) {
- 	// Try each cipher until we find one that authenticates successfully. This assumes that all ciphers are AEAD.
- 	// We snapshot the list because it may be modified while we use it.
- 	snapshot := cipherList.SnapshotForClientIP(clientIP)
- 	for ci, entry := range snapshot {
- 		id, cryptoKey := entry.Value.(*CipherEntry).ID, entry.Value.(*CipherEntry).CryptoKey
-+		limiter := entry.Value.(*CipherEntry).TrafficLimiter
- 		buf, err := shadowsocks.Unpack(dst, src, cryptoKey)
- 		if err != nil {
- 			debugUDP(id, "Failed to unpack: %v", err)
-@@ -78,9 +79,9 @@ func findAccessKeyUDP(clientIP net.IP, dst, src []byte, cipherList CipherList) (
- 		debugUDP(id, "Found cipher at index %d", ci)
- 		// Move the active cipher to the front, so that the search is quicker next time.
- 		cipherList.MarkUsedByClientIP(entry, clientIP)
--		return buf, id, cryptoKey, nil
-+		return buf, id, cryptoKey, limiter, nil
- 	}
--	return nil, "", nil, errors.New("could not find valid cipher")
-+	return nil, "", nil, nil, errors.New("could not find valid cipher")
+@@ -271,12 +273,17 @@ func probe(serverAddr *net.TCPAddr, bytesToSend []byte) error {
+ 	return nil
  }
  
- type packetHandler struct {
-@@ -92,7 +93,12 @@ type packetHandler struct {
++func makeLimiter(cipherList CipherList) TrafficLimiter {
++	c := MakeTestTrafficLimiterConfig(cipherList)
++	return NewTrafficLimiter(&c)
++}
++
+ func TestProbeRandom(t *testing.T) {
+ 	listener := makeLocalhostListener(t)
+ 	cipherList, err := MakeTestCiphers(makeTestSecrets(1))
+ 	require.NoError(t, err, "MakeTestCiphers failed: %v", err)
+ 	testMetrics := &probeTestMetrics{}
+-	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, nil, testMetrics, 200*time.Millisecond)
++	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, nil, testMetrics, 200*time.Millisecond, makeLimiter(cipherList))
+ 	done := make(chan struct{})
+ 	go func() {
+ 		StreamServe(WrapStreamListener(listener.AcceptTCP), handler.Handle)
+@@ -352,7 +359,7 @@ func TestProbeClientBytesBasicTruncated(t *testing.T) {
+ 	require.NoError(t, err, "MakeTestCiphers failed: %v", err)
+ 	cipher := firstCipher(cipherList)
+ 	testMetrics := &probeTestMetrics{}
+-	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, nil, testMetrics, 200*time.Millisecond)
++	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, nil, testMetrics, 200*time.Millisecond, makeLimiter(cipherList))
+ 	handler.SetTargetIPValidator(allowAll)
+ 	done := make(chan struct{})
+ 	go func() {
+@@ -387,7 +394,7 @@ func TestProbeClientBytesBasicModified(t *testing.T) {
+ 	require.NoError(t, err, "MakeTestCiphers failed: %v", err)
+ 	cipher := firstCipher(cipherList)
+ 	testMetrics := &probeTestMetrics{}
+-	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, nil, testMetrics, 200*time.Millisecond)
++	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, nil, testMetrics, 200*time.Millisecond, makeLimiter(cipherList))
+ 	handler.SetTargetIPValidator(allowAll)
+ 	done := make(chan struct{})
+ 	go func() {
+@@ -423,7 +430,7 @@ func TestProbeClientBytesCoalescedModified(t *testing.T) {
+ 	require.NoError(t, err, "MakeTestCiphers failed: %v", err)
+ 	cipher := firstCipher(cipherList)
+ 	testMetrics := &probeTestMetrics{}
+-	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, nil, testMetrics, 200*time.Millisecond)
++	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, nil, testMetrics, 200*time.Millisecond, makeLimiter(cipherList))
+ 	handler.SetTargetIPValidator(allowAll)
+ 	done := make(chan struct{})
+ 	go func() {
+@@ -466,7 +473,7 @@ func TestProbeServerBytesModified(t *testing.T) {
+ 	require.NoError(t, err, "MakeTestCiphers failed: %v", err)
+ 	cipher := firstCipher(cipherList)
+ 	testMetrics := &probeTestMetrics{}
+-	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, nil, testMetrics, 200*time.Millisecond)
++	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, nil, testMetrics, 200*time.Millisecond, makeLimiter(cipherList))
+ 	done := make(chan struct{})
+ 	go func() {
+ 		StreamServe(WrapStreamListener(listener.AcceptTCP), handler.Handle)
+@@ -496,7 +503,7 @@ func TestReplayDefense(t *testing.T) {
+ 	replayCache := NewReplayCache(5)
+ 	testMetrics := &probeTestMetrics{}
+ 	const testTimeout = 200 * time.Millisecond
+-	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, &replayCache, testMetrics, testTimeout)
++	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, &replayCache, testMetrics, testTimeout, makeLimiter(cipherList))
+ 	snapshot := cipherList.SnapshotForClientIP(nil)
+ 	cipherEntry := snapshot[0].Value.(*CipherEntry)
+ 	cipher := cipherEntry.CryptoKey
+@@ -574,7 +581,7 @@ func TestReverseReplayDefense(t *testing.T) {
+ 	replayCache := NewReplayCache(5)
+ 	testMetrics := &probeTestMetrics{}
+ 	const testTimeout = 200 * time.Millisecond
+-	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, &replayCache, testMetrics, testTimeout)
++	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, &replayCache, testMetrics, testTimeout, makeLimiter(cipherList))
+ 	snapshot := cipherList.SnapshotForClientIP(nil)
+ 	cipherEntry := snapshot[0].Value.(*CipherEntry)
+ 	cipher := cipherEntry.CryptoKey
+@@ -644,7 +651,7 @@ func probeExpectTimeout(t *testing.T, payloadSize int) {
+ 	cipherList, err := MakeTestCiphers(makeTestSecrets(5))
+ 	require.NoError(t, err, "MakeTestCiphers failed: %v", err)
+ 	testMetrics := &probeTestMetrics{}
+-	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, nil, testMetrics, testTimeout)
++	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, nil, testMetrics, testTimeout, makeLimiter(cipherList))
+ 
+ 	done := make(chan struct{})
+ 	go func() {
+diff --git a/service/udp.go b/service/udp.go
+index 4138ed8..3918e25 100644
+--- a/service/udp.go
++++ b/service/udp.go
+@@ -88,11 +88,18 @@ type packetHandler struct {
+ 	ciphers           CipherList
+ 	m                 UDPMetrics
+ 	targetIPValidator onet.TargetIPValidator
++	limiter           TrafficLimiter
+ }
  
  // NewPacketHandler creates a UDPService
- func NewPacketHandler(natTimeout time.Duration, cipherList CipherList, m UDPMetrics) PacketHandler {
+-func NewPacketHandler(natTimeout time.Duration, cipherList CipherList, m UDPMetrics) PacketHandler {
 -	return &packetHandler{natTimeout: natTimeout, ciphers: cipherList, m: m, targetIPValidator: onet.RequirePublicIP}
++func NewPacketHandler(natTimeout time.Duration, cipherList CipherList, m UDPMetrics, limiter TrafficLimiter) PacketHandler {
 +	return &packetHandler{
 +		natTimeout:        natTimeout,
 +		ciphers:           cipherList,
 +		m:                 m,
 +		targetIPValidator: onet.RequirePublicIP,
++		limiter:           limiter,
 +	}
  }
  
  // PacketHandler is a running UDP shadowsocks proxy that can be stopped.
-@@ -126,6 +132,7 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
- 		var clientInfo ipinfo.IPInfo
- 		keyID := ""
- 		var proxyTargetBytes int
-+		var limiter TrafficLimiter
+@@ -112,7 +119,7 @@ func (h *packetHandler) SetTargetIPValidator(targetIPValidator onet.TargetIPVali
+ func (h *packetHandler) Handle(clientConn net.PacketConn) {
+ 	var running sync.WaitGroup
  
- 		connError := func() (connError *onet.ConnectionError) {
- 			defer func() {
-@@ -160,7 +167,7 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
- 				var textData []byte
- 				var cryptoKey *shadowsocks.EncryptionKey
- 				unpackStart := time.Now()
--				textData, keyID, cryptoKey, err = findAccessKeyUDP(ip, textBuf, cipherData, h.ciphers)
-+				textData, keyID, cryptoKey, limiter, err = findAccessKeyUDP(ip, textBuf, cipherData, h.ciphers)
- 				timeToCipher := time.Since(unpackStart)
- 				h.m.AddUDPCipherSearch(err == nil, timeToCipher)
- 
-@@ -177,7 +184,7 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
- 				if err != nil {
- 					return onet.NewConnectionError("ERR_CREATE_SOCKET", "Failed to create UDP socket", err)
- 				}
--				targetConn = nm.Add(clientAddr, clientConn, cryptoKey, udpConn, clientInfo, keyID)
-+				targetConn = nm.Add(clientAddr, clientConn, cryptoKey, udpConn, clientInfo, keyID, limiter)
- 			} else {
- 				clientInfo = targetConn.clientInfo
- 
-@@ -192,6 +199,7 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
- 
- 				// The key ID is known with confidence once decryption succeeds.
- 				keyID = targetConn.keyID
-+				limiter = targetConn.limiter
- 
- 				var onetErr *onet.ConnectionError
- 				if payload, tgtUDPAddr, onetErr = h.validatePacket(textData); onetErr != nil {
-@@ -200,6 +208,11 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
+-	nm := newNATmap(h.natTimeout, h.m, &running)
++	nm := newNATmap(h.natTimeout, h.m, &running, h.limiter)
+ 	defer nm.Close()
+ 	cipherBuf := make([]byte, serverUDPBufferSize)
+ 	textBuf := make([]byte, serverUDPBufferSize)
+@@ -200,6 +207,11 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
  			}
  
  			debugUDPAddr(clientAddr, "Proxy exit %v", targetConn.LocalAddr())
-+			allowed := limiter.AllowRecv(len(payload))
++			allowed := h.limiter.Allow(keyID, len(payload))
 +			if !allowed {
 +				debugUDPAddr(clientAddr, "Rate limite exceeded, dropping packet from client (len %v)", len(payload))
 +				return onet.NewConnectionError("ERR_LIMIT", "Rate limit exceeded", nil)
@@ -1054,50 +1003,30 @@ index 4138ed8..c2bd9a1 100644
  			proxyTargetBytes, err = targetConn.WriteTo(payload, tgtUDPAddr) // accept only UDPAddr despite the signature
  			if err != nil {
  				return onet.NewConnectionError("ERR_WRITE", "Failed to write to target", err)
-@@ -246,6 +259,7 @@ type natconn struct {
- 	net.PacketConn
- 	cryptoKey *shadowsocks.EncryptionKey
- 	keyID     string
-+	limiter   TrafficLimiter
- 	// We store the client information in the NAT map to avoid recomputing it
- 	// for every downstream packet in a UDP-based connection.
- 	clientInfo ipinfo.IPInfo
-@@ -326,11 +340,14 @@ func (m *natmap) Get(key string) *natconn {
- 	return m.keyConn[key]
+@@ -311,10 +323,11 @@ type natmap struct {
+ 	timeout time.Duration
+ 	metrics UDPMetrics
+ 	running *sync.WaitGroup
++	limiter TrafficLimiter
  }
  
--func (m *natmap) set(key string, pc net.PacketConn, cryptoKey *shadowsocks.EncryptionKey, keyID string, clientInfo ipinfo.IPInfo) *natconn {
-+func (m *natmap) set(key string, pc net.PacketConn, cryptoKey *shadowsocks.EncryptionKey, keyID string, clientInfo ipinfo.IPInfo,
-+	limiter TrafficLimiter,
-+) *natconn {
- 	entry := &natconn{
- 		PacketConn:     pc,
- 		cryptoKey:      cryptoKey,
- 		keyID:          keyID,
-+		limiter:        limiter,
- 		clientInfo:     clientInfo,
- 		defaultTimeout: m.timeout,
- 	}
-@@ -354,13 +371,15 @@ func (m *natmap) del(key string) net.PacketConn {
- 	return nil
- }
- 
--func (m *natmap) Add(clientAddr net.Addr, clientConn net.PacketConn, cryptoKey *shadowsocks.EncryptionKey, targetConn net.PacketConn, clientInfo ipinfo.IPInfo, keyID string) *natconn {
--	entry := m.set(clientAddr.String(), targetConn, cryptoKey, keyID, clientInfo)
-+func (m *natmap) Add(clientAddr net.Addr, clientConn net.PacketConn, cryptoKey *shadowsocks.EncryptionKey, targetConn net.PacketConn, clientInfo ipinfo.IPInfo,
-+	keyID string, limiter TrafficLimiter,
-+) *natconn {
-+	entry := m.set(clientAddr.String(), targetConn, cryptoKey, keyID, clientInfo, limiter)
- 
+-func newNATmap(timeout time.Duration, sm UDPMetrics, running *sync.WaitGroup) *natmap {
+-	m := &natmap{metrics: sm, running: running}
++func newNATmap(timeout time.Duration, sm UDPMetrics, running *sync.WaitGroup, limiter TrafficLimiter) *natmap {
++	m := &natmap{metrics: sm, running: running, limiter: limiter}
+ 	m.keyConn = make(map[string]*natconn)
+ 	m.timeout = timeout
+ 	return m
+@@ -360,7 +373,7 @@ func (m *natmap) Add(clientAddr net.Addr, clientConn net.PacketConn, cryptoKey *
  	m.metrics.AddUDPNatEntry()
  	m.running.Add(1)
  	go func() {
 -		timedCopy(clientAddr, clientConn, entry, keyID, m.metrics)
-+		timedCopy(clientAddr, clientConn, entry, keyID, m.metrics, limiter)
++		timedCopy(clientAddr, clientConn, entry, keyID, m.metrics, m.limiter)
  		m.metrics.RemoveUDPNatEntry()
  		if pc := m.del(clientAddr.String()); pc != nil {
  			pc.Close()
-@@ -390,7 +409,8 @@ var maxAddrLen int = len(socks.ParseAddr("[2001:db8::1]:12345"))
+@@ -390,7 +403,8 @@ var maxAddrLen int = len(socks.ParseAddr("[2001:db8::1]:12345"))
  
  // copy from target to client until read timeout
  func timedCopy(clientAddr net.Addr, clientConn net.PacketConn, targetConn *natconn,
@@ -1107,12 +1036,12 @@ index 4138ed8..c2bd9a1 100644
  	// pkt is used for in-place encryption of downstream UDP packets, with the layout
  	// [padding?][salt][address][body][tag][extra]
  	// Padding is only used if the address is IPv4.
-@@ -424,6 +444,13 @@ func timedCopy(clientAddr net.Addr, clientConn net.PacketConn, targetConn *natco
+@@ -424,6 +438,13 @@ func timedCopy(clientAddr net.Addr, clientConn net.PacketConn, targetConn *natco
  			}
  
  			debugUDPAddr(clientAddr, "Got response from %v", raddr)
 +
-+			allowed := limiter.AllowSend(bodyLen)
++			allowed := limiter.Allow(keyID, bodyLen)
 +			if !allowed {
 +				debugUDPAddr(clientAddr, "Rate limite exceeded, dropping packet to client (len %v)", bodyLen)
 +				return onet.NewConnectionError("ERR_LIMIT", "Rate limit exceeded", nil)
@@ -1121,7 +1050,7 @@ index 4138ed8..c2bd9a1 100644
  			srcAddr := socks.ParseAddr(raddr.String())
  			addrStart := bodyStart - len(srcAddr)
  			// `plainTextBuf` concatenates the SOCKS address and body:
-@@ -471,8 +498,10 @@ var _ UDPMetrics = (*NoOpUDPMetrics)(nil)
+@@ -471,8 +492,10 @@ var _ UDPMetrics = (*NoOpUDPMetrics)(nil)
  func (m *NoOpUDPMetrics) GetIPInfo(net.IP) (ipinfo.IPInfo, error) {
  	return ipinfo.IPInfo{}, nil
  }
@@ -1133,7 +1062,7 @@ index 4138ed8..c2bd9a1 100644
  }
  func (m *NoOpUDPMetrics) AddUDPNatEntry()                                                    {}
 diff --git a/service/udp_test.go b/service/udp_test.go
-index 27756e3..236554a 100644
+index 27756e3..bd53126 100644
 --- a/service/udp_test.go
 +++ b/service/udp_test.go
 @@ -25,6 +25,7 @@ import (
@@ -1176,84 +1105,51 @@ index 27756e3..236554a 100644
  func (m *natTestMetrics) AddUDPNatEntry() {
  	m.natEntriesAdded++
  }
-@@ -122,7 +128,7 @@ func (m *natTestMetrics) AddUDPCipherSearch(accessKeyFound bool, timeToCipher ti
- // Takes a validation policy, and returns the metrics it
- // generates when localhost access is attempted
- func sendToDiscard(payloads [][]byte, validator onet.TargetIPValidator) *natTestMetrics {
--	ciphers, _ := MakeTestCiphers([]string{"asdf"})
-+	ciphers, _ := MakeTestCiphers([]string{"asdf"}, 0, 0)
+@@ -126,7 +132,7 @@ func sendToDiscard(payloads [][]byte, validator onet.TargetIPValidator) *natTest
  	cipher := ciphers.SnapshotForClientIP(nil)[0].Value.(*CipherEntry).CryptoKey
  	clientConn := makePacketConn()
  	metrics := &natTestMetrics{}
-@@ -210,10 +216,16 @@ func TestNATEmpty(t *testing.T) {
+-	handler := NewPacketHandler(timeout, ciphers, metrics)
++	handler := NewPacketHandler(timeout, ciphers, metrics, makeLimiter(ciphers))
+ 	handler.SetTargetIPValidator(validator)
+ 	done := make(chan struct{})
+ 	go func() {
+@@ -203,17 +209,26 @@ func assertAlmostEqual(t *testing.T, a, b time.Time) {
  }
  
- func setupNAT() (*fakePacketConn, *fakePacketConn, *natconn) {
-+	cipherList, err := MakeTestCiphers(ss.MakeTestSecrets(1), 0, 0)
+ func TestNATEmpty(t *testing.T) {
+-	nat := newNATmap(timeout, &natTestMetrics{}, &sync.WaitGroup{})
++	cipherList, err := MakeTestCiphers(ss.MakeTestSecrets(1))
 +	if err != nil {
 +		logger.Fatal(err)
 +	}
- 	nat := newNATmap(timeout, &natTestMetrics{}, &sync.WaitGroup{})
++	nat := newNATmap(timeout, &natTestMetrics{}, &sync.WaitGroup{}, makeLimiter(cipherList))
+ 	if nat.Get("foo") != nil {
+ 		t.Error("Expected nil value from empty NAT map")
+ 	}
+ }
+ 
+ func setupNAT() (*fakePacketConn, *fakePacketConn, *natconn) {
+-	nat := newNATmap(timeout, &natTestMetrics{}, &sync.WaitGroup{})
++	cipherList, err := MakeTestCiphers(ss.MakeTestSecrets(1))
++	if err != nil {
++		logger.Fatal(err)
++	}
++	nat := newNATmap(timeout, &natTestMetrics{}, &sync.WaitGroup{}, makeLimiter(cipherList))
  	clientConn := makePacketConn()
  	targetConn := makePacketConn()
 -	nat.Add(&clientAddr, clientConn, natCryptoKey, targetConn, ipinfo.IPInfo{CountryCode: "ZZ"}, "key id")
-+	entrySnap := cipherList.SnapshotForClientIP(net.IP{})[0].Value
-+	key, limiter := entrySnap.(*CipherEntry).ID, entrySnap.(*CipherEntry).TrafficLimiter
-+	nat.Add(&clientAddr, clientConn, natCryptoKey, targetConn, ipinfo.IPInfo{CountryCode: "ZZ"}, key, limiter)
++	key := cipherList.SnapshotForClientIP(net.IP{})[0].Value.(*CipherEntry).ID
++	nat.Add(&clientAddr, clientConn, natCryptoKey, targetConn, ipinfo.IPInfo{CountryCode: "ZZ"}, key)
  	entry := nat.Get(clientAddr.String())
  	return clientConn, targetConn, entry
  }
-@@ -396,7 +408,7 @@ func TestNATTimeout(t *testing.T) {
+@@ -478,7 +493,7 @@ func TestUDPEarlyClose(t *testing.T) {
+ 	}
+ 	testMetrics := &natTestMetrics{}
+ 	const testTimeout = 200 * time.Millisecond
+-	s := NewPacketHandler(testTimeout, cipherList, testMetrics)
++	s := NewPacketHandler(testTimeout, cipherList, testMetrics, makeLimiter(cipherList))
  
- // Simulates receiving invalid UDP packets on a server with 100 ciphers.
- func BenchmarkUDPUnpackFail(b *testing.B) {
--	cipherList, err := MakeTestCiphers(makeTestSecrets(100))
-+	cipherList, err := MakeTestCiphers(makeTestSecrets(100), 0, 0)
+ 	clientConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 0})
  	if err != nil {
- 		b.Fatal(err)
- 	}
-@@ -413,7 +425,7 @@ func BenchmarkUDPUnpackFail(b *testing.B) {
- // their own cipher and IP address.
- func BenchmarkUDPUnpackRepeat(b *testing.B) {
- 	const numCiphers = 100 // Must be <256
--	cipherList, err := MakeTestCiphers(makeTestSecrets(numCiphers))
-+	cipherList, err := MakeTestCiphers(makeTestSecrets(numCiphers), 0, 0)
- 	if err != nil {
- 		b.Fatal(err)
- 	}
-@@ -435,7 +447,7 @@ func BenchmarkUDPUnpackRepeat(b *testing.B) {
- 		cipherNumber := n % numCiphers
- 		ip := ips[cipherNumber]
- 		packet := packets[cipherNumber]
--		_, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
-+		_, _, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
- 		if err != nil {
- 			b.Error(err)
- 		}
-@@ -445,7 +457,7 @@ func BenchmarkUDPUnpackRepeat(b *testing.B) {
- // Simulates receiving valid UDP packets from 100 different IP addresses,
- // all using the same cipher.
- func BenchmarkUDPUnpackSharedKey(b *testing.B) {
--	cipherList, err := MakeTestCiphers(makeTestSecrets(1)) // One widely shared key
-+	cipherList, err := MakeTestCiphers(makeTestSecrets(1), 0, 0) // One widely shared key
- 	if err != nil {
- 		b.Fatal(err)
- 	}
-@@ -464,7 +476,7 @@ func BenchmarkUDPUnpackSharedKey(b *testing.B) {
- 	b.ResetTimer()
- 	for n := 0; n < b.N; n++ {
- 		ip := ips[n%numIPs]
--		_, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
-+		_, _, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
- 		if err != nil {
- 			b.Error(err)
- 		}
-@@ -472,7 +484,7 @@ func BenchmarkUDPUnpackSharedKey(b *testing.B) {
- }
- 
- func TestUDPEarlyClose(t *testing.T) {
--	cipherList, err := MakeTestCiphers(makeTestSecrets(1))
-+	cipherList, err := MakeTestCiphers(makeTestSecrets(1), 0, 0)
- 	if err != nil {
- 		t.Fatal(err)
- 	}
