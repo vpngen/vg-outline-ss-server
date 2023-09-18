@@ -1,0 +1,264 @@
+diff --git a/cmd/outline-ss-server/config_example.yml b/cmd/outline-ss-server/config_example.yml
+index c3e7286..3d2203c 100644
+--- a/cmd/outline-ss-server/config_example.yml
++++ b/cmd/outline-ss-server/config_example.yml
+@@ -1,4 +1,5 @@
+ bind_address: "127.0.0.1"
++self_policy: deny
+ bittorrent_filter:
+   block_duration: 60
+   udp_allowed_ports:
+@@ -12,6 +13,7 @@ keys:
+     port: 9000
+     cipher: chacha20-ietf-poly1305
+     secret: Secret0
++    allow_self: true
+     recv_limit: 128000
+     send_limit: 128000
+     allowed_lan:
+diff --git a/cmd/outline-ss-server/main.go b/cmd/outline-ss-server/main.go
+index 8d532c0..9f39ebc 100644
+--- a/cmd/outline-ss-server/main.go
++++ b/cmd/outline-ss-server/main.go
+@@ -125,8 +125,16 @@ func (s *SSServer) removePort(portNum int) error {
+ 	return nil
+ }
+ 
+-// ErrInvalidPortNumber is returned when a port number is not in the range 1-65535.
+-var ErrInvalidPortNumber = fmt.Errorf("invalid port number")
++var (
++	// ErrInvalidPortNumber is returned when a port number is not in the range 1-65535.
++	ErrInvalidPortNumber = fmt.Errorf("invalid port number")
++
++	// ErrInvalidSelfPolicy is returned when the self_policy is not "allow" or "deny".
++	ErrInvalidSelfPolicy = fmt.Errorf("invalid self_policy")
++
++	// ErrInvalidAllowSelfValue is returned when the allow_self value is not "true" or "false" or not set.
++	ErrInvalidAllowSelfValue = fmt.Errorf("invalid allow_self value")
++)
+ 
+ func (s *SSServer) loadConfig(filename string, bindAddrForOverwrite string) error {
+ 	config, err := readConfig(filename)
+@@ -140,6 +148,26 @@ func (s *SSServer) loadConfig(filename string, bindAddrForOverwrite string) erro
+ 		bindAddr = bindAddrForOverwrite
+ 	}
+ 
++	selfPolicy := 0
++
++	ip := net.ParseIP(bindAddr)
++	if config.SelfPolicy != "" && ip != nil && !ip.IsUnspecified() {
++		switch config.SelfPolicy {
++		case "allow":
++			selfPolicy = 1
++			logger.Infof("Allowing self access to all keys to %v", ip)
++		case "deny":
++			selfPolicy = -1
++			logger.Infof("Denying self access to all keys to %v", ip)
++		default:
++			return fmt.Errorf("%w: %v", ErrInvalidSelfPolicy, config.SelfPolicy)
++		}
++	}
++
++	if selfPolicy == 0 {
++		logger.Info("Self access to keys is not restricted")
++	}
++
+ 	bitFilter := &service.BitTorrentFilter{}
+ 	if config.BitTorrentFilter.BlockDuration > 0 {
+ 		logger.Infof("Bittorrent filter enabled with block duration %v seconds", config.BitTorrentFilter.BlockDuration)
+@@ -175,8 +203,29 @@ func (s *SSServer) loadConfig(filename string, bindAddrForOverwrite string) erro
+ 		if err != nil {
+ 			return fmt.Errorf("failed to create encyption key for key %v: %w", keyConfig.ID, err)
+ 		}
++		denySelf := (net.IP)(nil)
++		switch selfPolicy {
++		case -1: // deny all except
++			switch keyConfig.AllowSelf {
++			case "false", "":
++				denySelf = ip
++			case "true":
++				logger.Debugf("Allowing self access to key %v to %v", keyConfig.ID, ip)
++			default:
++				return fmt.Errorf("%w for key %v: %v", ErrInvalidAllowSelfValue, keyConfig.ID, keyConfig.AllowSelf)
++			}
++		case 1: // allow all except
++			switch keyConfig.AllowSelf {
++			case "false":
++				denySelf = ip
++				logger.Debugf("Denying self access to key %v to %v", keyConfig.ID, ip)
++			case "true", "":
++			default:
++				return fmt.Errorf("%w for key %v: %v", ErrInvalidAllowSelfValue, keyConfig.ID, keyConfig.AllowSelf)
++			}
++		}
+ 		entry := service.MakeCipherEntry(keyConfig.ID, cryptoKey, keyConfig.Secret,
+-			service.NewTrafficLimiter(keyConfig.RecvLimit, keyConfig.SendLimit), allowedPrivateNets)
++			service.NewTrafficLimiter(keyConfig.RecvLimit, keyConfig.SendLimit), allowedPrivateNets, denySelf)
+ 		cipherList.PushBack(&entry)
+ 	}
+ 	for port := range s.ports {
+@@ -250,6 +299,7 @@ type BitTorrentFilter struct {
+ 
+ type Config struct {
+ 	BindAddress      string           `yaml:"bind_address"`
++	SelfPolicy       string           `yaml:"self_policy"` // only if bind_address is set
+ 	BitTorrentFilter BitTorrentFilter `yaml:"bittorrent_filter"`
+ 	Keys             []struct {
+ 		ID         string   `yaml:"id"`
+@@ -259,6 +309,7 @@ type Config struct {
+ 		RecvLimit  int      `yaml:"recv_limit"`
+ 		SendLimit  int      `yaml:"send_limit"`
+ 		AllowedLAN []string `yaml:"allowed_lan"`
++		AllowSelf  string   `yaml:"allow_self"`
+ 	} `yaml:"keys"`
+ }
+ 
+diff --git a/service/cipher_list.go b/service/cipher_list.go
+index a87a2e5..7347743 100644
+--- a/service/cipher_list.go
++++ b/service/cipher_list.go
+@@ -16,6 +16,7 @@ package service
+ 
+ import (
+ 	"container/list"
++	"errors"
+ 	"net"
+ 	"sync"
+ 	"sync/atomic"
+@@ -36,10 +37,13 @@ type CipherEntry struct {
+ 	AllowedLAN     []*net.IPNet
+ 	lastClientIP   net.IP
+ 	BitBanned      atomic.Int64
++	DenySelf       net.IP
+ }
+ 
++var ErrTrafficForbidden = errors.New("traffic forbidden")
++
+ // MakeCipherEntry constructs a CipherEntry.
+-func MakeCipherEntry(id string, cryptoKey *shadowsocks.EncryptionKey, secret string, limiter TrafficLimiter, networks []*net.IPNet) CipherEntry {
++func MakeCipherEntry(id string, cryptoKey *shadowsocks.EncryptionKey, secret string, limiter TrafficLimiter, networks []*net.IPNet, selfIP net.IP) CipherEntry {
+ 	var saltGenerator ServerSaltGenerator
+ 	if cryptoKey.SaltSize()-serverSaltMarkLen >= minSaltEntropy {
+ 		// Mark salts with a tag for reverse replay protection.
+@@ -55,6 +59,7 @@ func MakeCipherEntry(id string, cryptoKey *shadowsocks.EncryptionKey, secret str
+ 		SaltGenerator:  saltGenerator,
+ 		TrafficLimiter: limiter,
+ 		AllowedLAN:     networks,
++		DenySelf:       selfIP,
+ 	}
+ }
+ 
+diff --git a/service/cipher_list_testing.go b/service/cipher_list_testing.go
+index e0e33ee..eb7159d 100644
+--- a/service/cipher_list_testing.go
++++ b/service/cipher_list_testing.go
+@@ -32,7 +32,7 @@ func MakeTestCiphers(secrets []string, rx, tx int) (CipherList, error) {
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to create cipher %v: %w", i, err)
+ 		}
+-		entry := MakeCipherEntry(cipherID, cipher, secrets[i], NewTrafficLimiter(rx, tx), []*net.IPNet{})
++		entry := MakeCipherEntry(cipherID, cipher, secrets[i], NewTrafficLimiter(rx, tx), []*net.IPNet{}, nil)
+ 		l.PushBack(&entry)
+ 	}
+ 	cipherList := NewCipherList()
+diff --git a/service/tcp.go b/service/tcp.go
+index c72965d..03dda93 100644
+--- a/service/tcp.go
++++ b/service/tcp.go
+@@ -287,6 +287,19 @@ func (h *tcpHandler) handleConnection(listenerPort int, clientConn transport.Str
+ 	// 3. Read target address and dial it.
+ 	ssr := shadowsocks.NewReader(clientReader, cipherEntry.CryptoKey)
+ 	tgtAddr, err := socks.ReadAddr(ssr)
++	if cipherEntry.DenySelf != nil {
++		switch []byte(tgtAddr)[0] {
++		case socks.AtypDomainName:
++		case socks.AtypIPv4:
++			if cipherEntry.DenySelf.Equal(net.IP(tgtAddr[1:5])) {
++				return id, onet.NewConnectionError("ERR_RELAY_TARGET", "Failed to relay traffic to target", ErrTrafficForbidden)
++			}
++		case socks.AtypIPv6:
++			if cipherEntry.DenySelf.Equal(net.IP(tgtAddr[1:17])) {
++				return id, onet.NewConnectionError("ERR_RELAY_TARGET", "Failed to relay traffic to target", ErrTrafficForbidden)
++			}
++		}
++	}
+ 	// Clear the deadline for the target address
+ 	clientConn.SetReadDeadline(time.Time{})
+ 	if err != nil {
+diff --git a/service/udp.go b/service/udp.go
+index e6e35f4..3a9418f 100644
+--- a/service/udp.go
++++ b/service/udp.go
+@@ -65,7 +65,7 @@ func debugUDPAddr(addr net.Addr, template string, val interface{}) {
+ // Decrypts src into dst. It tries each cipher until it finds one that authenticates
+ // correctly. dst and src must not overlap.
+ func findAccessKeyUDP(clientIP net.IP, dst, src []byte, cipherList CipherList) ([]byte, string, *shadowsocks.EncryptionKey,
+-	TrafficLimiter, []*net.IPNet, func(net.PacketConn) net.PacketConn,
++	TrafficLimiter, []*net.IPNet, func(net.PacketConn) net.PacketConn, net.IP,
+ 	error,
+ ) {
+ 	// Try each cipher until we find one that authenticates successfully. This assumes that all ciphers are AEAD.
+@@ -75,6 +75,7 @@ func findAccessKeyUDP(clientIP net.IP, dst, src []byte, cipherList CipherList) (
+ 		id, cryptoKey := entry.Value.(*CipherEntry).ID, entry.Value.(*CipherEntry).CryptoKey
+ 		limiter := entry.Value.(*CipherEntry).TrafficLimiter
+ 		networks := entry.Value.(*CipherEntry).AllowedLAN
++		denySelf := entry.Value.(*CipherEntry).DenySelf
+ 		buf, err := shadowsocks.Unpack(dst, src, cryptoKey)
+ 		if err != nil {
+ 			debugUDP(id, "Failed to unpack: %v", err)
+@@ -86,9 +87,9 @@ func findAccessKeyUDP(clientIP net.IP, dst, src []byte, cipherList CipherList) (
+ 
+ 		bitFilterConnFunc := GetUDPBitFilterConnFunc(bittorentFilter, entry.Value.(*CipherEntry))
+ 
+-		return buf, id, cryptoKey, limiter, networks, bitFilterConnFunc, nil
++		return buf, id, cryptoKey, limiter, networks, bitFilterConnFunc, denySelf, nil
+ 	}
+-	return nil, "", nil, nil, nil, nil, errors.New("could not find valid cipher")
++	return nil, "", nil, nil, nil, nil, nil, errors.New("could not find valid cipher")
+ }
+ 
+ type packetHandler struct {
+@@ -175,8 +176,9 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
+ 				var textData []byte
+ 				var cryptoKey *shadowsocks.EncryptionKey
+ 				var bitFilterConnFunc func(net.PacketConn) net.PacketConn
++				var denySelf net.IP
+ 				unpackStart := time.Now()
+-				textData, keyID, cryptoKey, limiter, allowedLAN, bitFilterConnFunc, err = findAccessKeyUDP(ip, textBuf, cipherData, h.ciphers)
++				textData, keyID, cryptoKey, limiter, allowedLAN, bitFilterConnFunc, denySelf, err = findAccessKeyUDP(ip, textBuf, cipherData, h.ciphers)
+ 				timeToCipher := time.Since(unpackStart)
+ 				h.m.AddUDPCipherSearch(err == nil, timeToCipher)
+ 
+@@ -189,6 +191,10 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
+ 					return onetErr
+ 				}
+ 
++				if denySelf != nil && denySelf.Equal(tgtUDPAddr.IP) {
++					return onet.NewConnectionError("ERR_RELAY_TARGET", "Failed to relay traffic to target", ErrTrafficForbidden)
++				}
++
+ 				udpConn, err := net.ListenPacket("udp", "")
+ 				if err != nil {
+ 					return onet.NewConnectionError("ERR_CREATE_SOCKET", "Failed to create UDP socket", err)
+diff --git a/service/udp_test.go b/service/udp_test.go
+index a54b373..38e9c67 100644
+--- a/service/udp_test.go
++++ b/service/udp_test.go
+@@ -449,7 +449,7 @@ func BenchmarkUDPUnpackRepeat(b *testing.B) {
+ 		cipherNumber := n % numCiphers
+ 		ip := ips[cipherNumber]
+ 		packet := packets[cipherNumber]
+-		_, _, _, _, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
++		_, _, _, _, _, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
+ 		if err != nil {
+ 			b.Error(err)
+ 		}
+@@ -478,7 +478,7 @@ func BenchmarkUDPUnpackSharedKey(b *testing.B) {
+ 	b.ResetTimer()
+ 	for n := 0; n < b.N; n++ {
+ 		ip := ips[n%numIPs]
+-		_, _, _, _, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
++		_, _, _, _, _, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
+ 		if err != nil {
+ 			b.Error(err)
+ 		}

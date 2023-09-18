@@ -1,0 +1,709 @@
+diff --git a/cmd/outline-ss-server/config_example.yml b/cmd/outline-ss-server/config_example.yml
+index aa4c56c..1174509 100644
+--- a/cmd/outline-ss-server/config_example.yml
++++ b/cmd/outline-ss-server/config_example.yml
+@@ -1,4 +1,12 @@
+ bind_address: "127.0.0.1"
++bittorrent_filter:
++  block_duration: 60
++  udp_allowed_ports:
++    - 53
++    - 123
++  tcp_allowed_ports:
++    - 80
++    - 443
+ keys:
+   - id: user-0
+     port: 9000
+diff --git a/cmd/outline-ss-server/main.go b/cmd/outline-ss-server/main.go
+index b1d3a60..ae02e4b 100644
+--- a/cmd/outline-ss-server/main.go
++++ b/cmd/outline-ss-server/main.go
+@@ -124,6 +124,9 @@ func (s *SSServer) removePort(portNum int) error {
+ 	return nil
+ }
+ 
++// ErrInvalidPortNumber is returned when a port number is not in the range 1-65535.
++var ErrInvalidPortNumber = fmt.Errorf("invalid port number")
++
+ func (s *SSServer) loadConfig(filename string, bindAddrForOverwrite string) error {
+ 	config, err := readConfig(filename)
+ 	if err != nil {
+@@ -136,6 +139,24 @@ func (s *SSServer) loadConfig(filename string, bindAddrForOverwrite string) erro
+ 		bindAddr = bindAddrForOverwrite
+ 	}
+ 
++	bitFilter := &service.BitTorrentFilter{}
++	if config.BitTorrentFilter.BlockDuration > 0 {
++		logger.Infof("Bittorrent filter enabled with block duration %v seconds", config.BitTorrentFilter.BlockDuration)
++		bitFilter.BlockDuration = config.BitTorrentFilter.BlockDuration // in seconds
++		for _, port := range config.BitTorrentFilter.UDPAllowedPorts {
++			if port < 1 || port > 65535 {
++				return fmt.Errorf("UDP %w :%v", ErrInvalidPortNumber, port)
++			}
++			bitFilter.UDPAllowedPorts = append(bitFilter.UDPAllowedPorts, port)
++		}
++		for _, port := range config.BitTorrentFilter.TCPAllowedPorts {
++			if port < 1 || port > 65535 {
++				return fmt.Errorf("TCP %w :%v", ErrInvalidPortNumber, port)
++			}
++			bitFilter.TCPAllowedPorts = append(bitFilter.TCPAllowedPorts, port)
++		}
++	}
++
+ 	portChanges := make(map[int]int)
+ 	portCiphers := make(map[int]*list.List) // Values are *List of *CipherEntry.
+ 	for _, keyConfig := range config.Keys {
+@@ -168,7 +189,7 @@ func (s *SSServer) loadConfig(filename string, bindAddrForOverwrite string) erro
+ 		}
+ 	}
+ 	for portNum, cipherList := range portCiphers {
+-		s.ports[portNum].cipherList.Update(cipherList)
++		s.ports[portNum].cipherList.Update(cipherList, bitFilter)
+ 	}
+ 	logger.Infof("Loaded %v access keys over %v ports", len(config.Keys), len(s.ports))
+ 	s.m.SetNumAccessKeys(len(config.Keys), len(portCiphers))
+@@ -212,9 +233,20 @@ func RunSSServer(filename string, natTimeout time.Duration, sm *outlineMetrics,
+ 	return server, nil
+ }
+ 
++// BitTorrentFilter is the configuration for the Bittorrent filter.
++type BitTorrentFilter struct {
++	// BlockDuration is the duration of the block in seconds.
++	BlockDuration int `yaml:"block_duration"`
++	// UDPAllowedPorts is the list of allowed UDP ports.
++	UDPAllowedPorts []int `yaml:"udp_allowed_ports"`
++	// TCPAllowedPorts is the list of allowed TCP ports.
++	TCPAllowedPorts []int `yaml:"tcp_allowed_ports"`
++}
++
+ type Config struct {
+-	BindAddress string `yaml:"bind_address"`
+-	Keys        []struct {
++	BindAddress      string           `yaml:"bind_address"`
++	BitTorrentFilter BitTorrentFilter `yaml:"bittorrent_filter"`
++	Keys             []struct {
+ 		ID        string `yaml:"id"`
+ 		Port      int    `yaml:"port"`
+ 		Cipher    string `yaml:"cipher"`
+diff --git a/internal/integration_test/integration_test.go b/internal/integration_test/integration_test.go
+index a9366c7..f8d11df 100644
+--- a/internal/integration_test/integration_test.go
++++ b/internal/integration_test/integration_test.go
+@@ -482,7 +482,7 @@ func TestUDPEcho(t *testing.T) {
+ 	proxyConn.Close()
+ 	<-done
+ 	// Verify that the expected metrics were reported.
+-	snapshot := cipherList.SnapshotForClientIP(nil)
++	snapshot, _ := cipherList.SnapshotForClientIP(nil)
+ 	keyID := snapshot[0].Value.(*service.CipherEntry).ID
+ 
+ 	if testMetrics.natAdded != 1 {
+diff --git a/service/bittorent_filter.go b/service/bittorent_filter.go
+new file mode 100644
+index 0000000..719e81f
+--- /dev/null
++++ b/service/bittorent_filter.go
+@@ -0,0 +1,248 @@
++// Copyright 2023 Jigsaw Operations LLC
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     https://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.package service
++
++package service
++
++import (
++	"bytes"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"net"
++	"net/netip"
++	"time"
++
++	"github.com/Jigsaw-Code/outline-sdk/transport"
++)
++
++type BitTorrentFilter struct {
++	BlockDuration   int
++	UDPAllowedPorts []int
++	TCPAllowedPorts []int
++}
++
++type udpBitTorentFilteredConn struct {
++	net.PacketConn
++	filter *BitTorrentFilter
++	entry  *CipherEntry
++}
++
++var ErrBitTorentBanned = errors.New("bittorent banned")
++
++func udpDetectBitTorrent(b []byte) bool {
++	switch len(b) {
++	case 20:
++		if binary.BigEndian.Uint32(b[0:4]) == 0x00000417 && binary.BigEndian.Uint32(b[4:8]) == 0x27101980 {
++			logger.Debugf("BitTorent detected /* ^ 00 00 04 17 27 10 19 80 */")
++			return true
++		}
++	case 36:
++		if binary.BigEndian.Uint32(b[8:12]) == 0x00000400 {
++			if binary.BigEndian.Uint32(b[28:32]) == 0x00000104 {
++				logger.Debugf("BitTorent detected /* #8 00 00 04 00 #28 00 00 01 04 */")
++				return true
++			}
++
++			logger.Debugf("BitTorent detected /* #8 00 00 04 00 */")
++			return true
++		}
++	case 57:
++		if binary.BigEndian.Uint32(b[8:12]) == 0x00000404 {
++			if binary.BigEndian.Uint32(b[28:32]) == 0x00000104 {
++				logger.Debugf("BitTorent detected /* #8 00 00 04 04 #28 00 00 01 04 */")
++				return true
++			}
++
++			logger.Debugf("BitTorent detected /* #8 00 00 04 04 */")
++			return true
++		}
++	case 59:
++		if binary.BigEndian.Uint32(b[8:12]) == 0x00000406 {
++			if binary.BigEndian.Uint32(b[28:32]) == 0x00000104 {
++				logger.Debugf("BitTorent detected /* #8 00 00 04 04 #28 00 00 01 04 */")
++				return true
++			}
++
++			logger.Debugf("BitTorent detected /* #8 00 00 04 04 */")
++			return true
++		}
++	case 203:
++		if binary.BigEndian.Uint32(b[0:4]) == 0x00000405 {
++			logger.Debugf("BitTorent detected /* #8 00 00 04 05 */")
++			return true
++		}
++	case 21:
++		if binary.BigEndian.Uint32(b[0:4]) == 0x00000401 {
++			logger.Debugf("BitTorent detected /* #8 00 00 04 01 */")
++			return true
++		}
++	case 44:
++		if binary.BigEndian.Uint32(b[0:4]) == 0x00000827 && binary.BigEndian.Uint32(b[4:8]) == 0x37502950 {
++			logger.Debugf("BitTorent detected /* ^ 00 00 08 27 37 50 29 50 */")
++			return true
++		}
++	default:
++		if len(b) > 40 {
++			if binary.BigEndian.Uint32(b[8:12]) == 0x00000402 && binary.BigEndian.Uint32(b[28:32]) == 0x00000104 {
++				logger.Debugf("BitTorent detected /* #8 00 00 04 02 #28 00 00 01 04 */")
++				return true
++			}
++		}
++
++		if len(b) > 30 {
++			if b[0] == 'd' && b[1] == '1' && b[2] == ':' &&
++				(b[3] == 'a' || b[3] == 'r') &&
++				b[4] == 'd' && b[5] == '2' && b[6] == ':' && b[7] == 'i' && b[8] == 'd' && b[9] == '2' && b[10] == '0' {
++				logger.Debugf("BitTorent detected /* ^ d1:[a|r]d2:id20 */")
++				return true
++			}
++		}
++	}
++
++	return false
++}
++
++func (c *udpBitTorentFilteredConn) WriteTo(b []byte, addr net.Addr) (int, error) {
++	if c.filter == nil || c.entry == nil || c.filter.BlockDuration == 0 {
++		return c.PacketConn.WriteTo(b, addr)
++	}
++
++	ts := int64(0)
++
++	bitBanned := c.entry.BitBanned.Load()
++	if bitBanned != 0 {
++		ts = time.Now().Unix()
++		if ts < bitBanned || !c.entry.BitBanned.CompareAndSwap(bitBanned, 0) {
++			if filter(c.filter.UDPAllowedPorts, addr) != nil {
++				return 0, ErrBitTorentBanned
++			}
++		}
++	}
++
++	if udpDetectBitTorrent(b) {
++		if ts == 0 {
++			ts = time.Now().Unix()
++		}
++
++		c.entry.BitBanned.Store(ts + int64(c.filter.BlockDuration))
++
++		if filter(c.filter.UDPAllowedPorts, addr) != nil {
++			return 0, ErrBitTorentBanned
++		}
++	}
++
++	return c.PacketConn.WriteTo(b, addr)
++}
++
++func GetUDPBitFilterConnFunc(filter *BitTorrentFilter, entry *CipherEntry) func(net.PacketConn) net.PacketConn {
++	return func(conn net.PacketConn) net.PacketConn {
++		return &udpBitTorentFilteredConn{PacketConn: conn, filter: filter, entry: entry}
++	}
++}
++
++type tcpBittorentFilteredConn struct {
++	net.TCPConn
++	filter *BitTorrentFilter
++	entry  *CipherEntry
++}
++
++func tcpDetectBitTorrent(b []byte) bool {
++	if len(b) > 20 {
++		if bytes.Equal(append([]byte{0x13}, []byte("BitTorrent protocol")...), b[:20]) {
++			logger.Debugf("BitTorent detected /* ^ 13  BitTorrent protocol*/")
++
++			return true
++		}
++
++		if bytes.Equal([]byte("GET /"), b[:5]) {
++			if bytes.Equal([]byte("scrape?info_hash="), b[5:22]) {
++				logger.Debugf("BitTorent detected /* ^ GET /scrape?info_hash= */")
++
++				return true
++			}
++
++			if bytes.Equal([]byte("announce?info_hash="), b[5:24]) {
++				logger.Debugf("BitTorent detected /* ^ GET /announce?info_hash= */")
++
++				return true
++			}
++		}
++	}
++
++	if len(b) == 17 {
++		if binary.BigEndian.Uint32(b[0:4]) == 0x0000000d && b[4] == 0x06 && binary.BigEndian.Uint32(b[13:17]) == 0x00004000 {
++			logger.Debugf("BitTorent detected /* ^ 00 00 00 0d 06 ... 00 00 40 00 */")
++
++			return true
++		}
++	}
++
++	return false
++}
++
++func (c *tcpBittorentFilteredConn) Write(b []byte) (int, error) {
++	if c.filter == nil || c.entry == nil || c.filter.BlockDuration == 0 {
++		return c.TCPConn.Write(b)
++	}
++
++	ts := int64(0)
++
++	bitBanned := c.entry.BitBanned.Load()
++	if bitBanned != 0 {
++		ts = time.Now().Unix()
++		if ts < bitBanned || !c.entry.BitBanned.CompareAndSwap(bitBanned, 0) {
++			if filter(c.filter.TCPAllowedPorts, c.RemoteAddr()) != nil {
++				return 0, ErrBitTorentBanned
++			}
++		}
++	}
++
++	if tcpDetectBitTorrent(b) {
++		if ts == 0 {
++			ts = time.Now().Unix()
++		}
++
++		c.entry.BitBanned.Store(ts + int64(c.filter.BlockDuration))
++
++		if filter(c.filter.TCPAllowedPorts, c.RemoteAddr()) != nil {
++			return 0, ErrBitTorentBanned
++		}
++	}
++
++	return c.TCPConn.Write(b)
++}
++
++func GetTCPBitFilterConnFunc(filter *BitTorrentFilter, entry *CipherEntry) func(*net.TCPConn) transport.StreamConn {
++	return func(conn *net.TCPConn) transport.StreamConn {
++		return &tcpBittorentFilteredConn{TCPConn: *conn, filter: filter, entry: entry}
++	}
++}
++
++func filter(allow []int, addr net.Addr) error {
++	s := addr.String()
++
++	netPort, err := netip.ParseAddrPort(s)
++	if err != nil {
++		return fmt.Errorf("failed to parse address: %s: %w", s, err)
++	}
++
++	port := int(netPort.Port())
++	for _, allowed := range allow {
++		if port == allowed {
++			return nil
++		}
++	}
++
++	return ErrBitTorentBanned
++}
+diff --git a/service/cipher_list.go b/service/cipher_list.go
+index 3794303..b0de9e8 100644
+--- a/service/cipher_list.go
++++ b/service/cipher_list.go
+@@ -18,6 +18,7 @@ import (
+ 	"container/list"
+ 	"net"
+ 	"sync"
++	"sync/atomic"
+ 
+ 	"github.com/Jigsaw-Code/outline-sdk/transport/shadowsocks"
+ )
+@@ -33,6 +34,7 @@ type CipherEntry struct {
+ 	SaltGenerator  ServerSaltGenerator
+ 	TrafficLimiter TrafficLimiter
+ 	lastClientIP   net.IP
++	BitBanned      atomic.Int64
+ }
+ 
+ // MakeCipherEntry constructs a CipherEntry.
+@@ -58,18 +60,19 @@ func MakeCipherEntry(id string, cryptoKey *shadowsocks.EncryptionKey, secret str
+ // snapshotting and moving to front.
+ type CipherList interface {
+ 	// Returns a snapshot of the cipher list optimized for this client IP
+-	SnapshotForClientIP(clientIP net.IP) []*list.Element
++	SnapshotForClientIP(clientIP net.IP) ([]*list.Element, *BitTorrentFilter)
+ 	MarkUsedByClientIP(e *list.Element, clientIP net.IP)
+ 	// Update replaces the current contents of the CipherList with `contents`,
+ 	// which is a List of *CipherEntry.  Update takes ownership of `contents`,
+ 	// which must not be read or written after this call.
+-	Update(contents *list.List)
++	Update(contents *list.List, bitFilter *BitTorrentFilter)
+ }
+ 
+ type cipherList struct {
+ 	CipherList
+-	list *list.List
+-	mu   sync.RWMutex
++	list      *list.List
++	bitFilter *BitTorrentFilter
++	mu        sync.RWMutex
+ }
+ 
+ // NewCipherList creates an empty CipherList
+@@ -82,7 +85,7 @@ func matchesIP(e *list.Element, clientIP net.IP) bool {
+ 	return clientIP != nil && clientIP.Equal(c.lastClientIP)
+ }
+ 
+-func (cl *cipherList) SnapshotForClientIP(clientIP net.IP) []*list.Element {
++func (cl *cipherList) SnapshotForClientIP(clientIP net.IP) ([]*list.Element, *BitTorrentFilter) {
+ 	cl.mu.RLock()
+ 	defer cl.mu.RUnlock()
+ 	cipherArray := make([]*list.Element, cl.list.Len())
+@@ -101,7 +104,7 @@ func (cl *cipherList) SnapshotForClientIP(clientIP net.IP) []*list.Element {
+ 			i++
+ 		}
+ 	}
+-	return cipherArray
++	return cipherArray, cl.bitFilter
+ }
+ 
+ func (cl *cipherList) MarkUsedByClientIP(e *list.Element, clientIP net.IP) {
+@@ -113,8 +116,10 @@ func (cl *cipherList) MarkUsedByClientIP(e *list.Element, clientIP net.IP) {
+ 	c.lastClientIP = clientIP
+ }
+ 
+-func (cl *cipherList) Update(src *list.List) {
++func (cl *cipherList) Update(src *list.List, bitFilter *BitTorrentFilter) {
+ 	cl.mu.Lock()
+ 	cl.list = src
++	cl.bitFilter = bitFilter
++	logger.Debugf("Bittorrent filter: %v", bitFilter)
+ 	cl.mu.Unlock()
+ }
+diff --git a/service/cipher_list_test.go b/service/cipher_list_test.go
+index 11cd1ea..2600630 100644
+--- a/service/cipher_list_test.go
++++ b/service/cipher_list_test.go
+@@ -29,7 +29,7 @@ func BenchmarkLocking(b *testing.B) {
+ 	b.ResetTimer()
+ 	b.RunParallel(func(pb *testing.PB) {
+ 		for pb.Next() {
+-			entries := ciphers.SnapshotForClientIP(nil)
++			entries, _ := ciphers.SnapshotForClientIP(nil)
+ 			ciphers.MarkUsedByClientIP(entries[0], ip)
+ 		}
+ 	})
+@@ -45,7 +45,7 @@ func BenchmarkSnapshot(b *testing.B) {
+ 
+ 	// Shuffling simulates the behavior of a real server, where successive
+ 	// ciphers are not expected to be nearby in memory.
+-	entries := ciphers.SnapshotForClientIP(nil)
++	entries, _ := ciphers.SnapshotForClientIP(nil)
+ 	rand.Shuffle(N, func(i, j int) {
+ 		entries[i], entries[j] = entries[j], entries[i]
+ 	})
+diff --git a/service/cipher_list_testing.go b/service/cipher_list_testing.go
+index dcba9b2..b4b8a6c 100644
+--- a/service/cipher_list_testing.go
++++ b/service/cipher_list_testing.go
+@@ -35,7 +35,7 @@ func MakeTestCiphers(secrets []string, rx, tx int) (CipherList, error) {
+ 		l.PushBack(&entry)
+ 	}
+ 	cipherList := NewCipherList()
+-	cipherList.Update(l)
++	cipherList.Update(l, &BitTorrentFilter{})
+ 	return cipherList, nil
+ }
+ 
+diff --git a/service/tcp.go b/service/tcp.go
+index 46b5259..a48a800 100644
+--- a/service/tcp.go
++++ b/service/tcp.go
+@@ -78,12 +78,12 @@ func debugTCP(cipherID, template string, val interface{}) {
+ // required = saltSize + 2 + cipher.TagSize, the number of bytes needed to authenticate the connection.
+ const bytesForKeyFinding = 50
+ 
+-func findAccessKey(clientReader io.Reader, clientIP net.IP, cipherList CipherList) (*CipherEntry, io.Reader, []byte, time.Duration, error) {
++func findAccessKey(clientReader io.Reader, clientIP net.IP, cipherList CipherList) (*CipherEntry, io.Reader, []byte, time.Duration, func(*net.TCPConn) transport.StreamConn, error) {
+ 	// We snapshot the list because it may be modified while we use it.
+-	ciphers := cipherList.SnapshotForClientIP(clientIP)
++	ciphers, bittorentFilter := cipherList.SnapshotForClientIP(clientIP)
+ 	firstBytes := make([]byte, bytesForKeyFinding)
+ 	if n, err := io.ReadFull(clientReader, firstBytes); err != nil {
+-		return nil, clientReader, nil, 0, fmt.Errorf("reading header failed after %d bytes: %w", n, err)
++		return nil, clientReader, nil, 0, nil, fmt.Errorf("reading header failed after %d bytes: %w", n, err)
+ 	}
+ 
+ 	findStartTime := time.Now()
+@@ -91,13 +91,16 @@ func findAccessKey(clientReader io.Reader, clientIP net.IP, cipherList CipherLis
+ 	timeToCipher := time.Since(findStartTime)
+ 	if entry == nil {
+ 		// TODO: Ban and log client IPs with too many failures too quick to protect against DoS.
+-		return nil, clientReader, nil, timeToCipher, fmt.Errorf("could not find valid TCP cipher")
++		return nil, clientReader, nil, timeToCipher, nil, fmt.Errorf("could not find valid TCP cipher")
+ 	}
+ 
+ 	// Move the active cipher to the front, so that the search is quicker next time.
+ 	cipherList.MarkUsedByClientIP(elt, clientIP)
+ 	salt := firstBytes[:entry.CryptoKey.SaltSize()]
+-	return entry, io.MultiReader(bytes.NewReader(firstBytes), clientReader), salt, timeToCipher, nil
++
++	bitFilterConnFunc := GetTCPBitFilterConnFunc(bittorentFilter, entry)
++
++	return entry, io.MultiReader(bytes.NewReader(firstBytes), clientReader), salt, timeToCipher, bitFilterConnFunc, nil
+ }
+ 
+ // Implements a trial decryption search.  This assumes that all ciphers are AEAD.
+@@ -154,7 +157,9 @@ func (s *tcpHandler) SetTargetIPValidator(targetIPValidator onet.TargetIPValidat
+ 	s.targetIPValidator = targetIPValidator
+ }
+ 
+-func dialTarget(tgtAddr socks.Addr, proxyMetrics *metrics.ProxyMetrics, targetIPValidator onet.TargetIPValidator) (transport.StreamConn, *onet.ConnectionError) {
++func dialTarget(tgtAddr socks.Addr, proxyMetrics *metrics.ProxyMetrics,
++	targetIPValidator onet.TargetIPValidator, bitFilterConnFunc func(*net.TCPConn) transport.StreamConn,
++) (transport.StreamConn, *onet.ConnectionError) {
+ 	var ipError *onet.ConnectionError
+ 	dialer := net.Dialer{Control: func(network, address string, c syscall.RawConn) error {
+ 		ip, _, _ := net.SplitHostPort(address)
+@@ -170,9 +175,10 @@ func dialTarget(tgtAddr socks.Addr, proxyMetrics *metrics.ProxyMetrics, targetIP
+ 	} else if err != nil {
+ 		return nil, onet.NewConnectionError("ERR_CONNECT", "Failed to connect to target", err)
+ 	}
++	// TODO: Wrap the connection with bittorent filter.
+ 	tgtTCPConn := tgtConn.(*net.TCPConn)
+ 	tgtTCPConn.SetKeepAlive(true)
+-	return metrics.MeasureConn(tgtTCPConn, &proxyMetrics.ProxyTarget, &proxyMetrics.TargetProxy), nil
++	return metrics.MeasureConn(bitFilterConnFunc(tgtTCPConn), &proxyMetrics.ProxyTarget, &proxyMetrics.TargetProxy), nil
+ }
+ 
+ type StreamListener func() (transport.StreamConn, error)
+@@ -246,7 +252,7 @@ func (h *tcpHandler) handleConnection(listenerPort int, clientConn transport.Str
+ 	clientConn.SetReadDeadline(time.Now().Add(h.readTimeout))
+ 
+ 	// 1. Find the cipher and acess key id.
+-	cipherEntry, clientReader, clientSalt, timeToCipher, keyErr := findAccessKey(clientConn, remoteIP(clientConn), h.ciphers)
++	cipherEntry, clientReader, clientSalt, timeToCipher, bitFilterConnFunc, keyErr := findAccessKey(clientConn, remoteIP(clientConn), h.ciphers)
+ 	h.m.AddTCPCipherSearch(keyErr == nil, timeToCipher)
+ 	if keyErr != nil {
+ 		logger.Debugf("Failed to find a valid cipher after reading %v bytes: %v", proxyMetrics.ClientProxy, keyErr)
+@@ -289,7 +295,7 @@ func (h *tcpHandler) handleConnection(listenerPort int, clientConn transport.Str
+ 		return id, onet.NewConnectionError("ERR_READ_ADDRESS", "Failed to get target address", err)
+ 	}
+ 	logger.Debugf("address %s", clientConn.RemoteAddr().String())
+-	tgtConn, dialErr := dialTarget(tgtAddr, proxyMetrics, h.targetIPValidator)
++	tgtConn, dialErr := dialTarget(tgtAddr, proxyMetrics, h.targetIPValidator, bitFilterConnFunc)
+ 	if dialErr != nil {
+ 		// We don't drain so dial errors and invalid addresses are communicated quickly.
+ 		return id, dialErr
+diff --git a/service/tcp_test.go b/service/tcp_test.go
+index b6062bf..a03f1d3 100644
+--- a/service/tcp_test.go
++++ b/service/tcp_test.go
+@@ -192,7 +192,7 @@ func BenchmarkTCPFindCipherRepeat(b *testing.B) {
+ 		b.Fatal(err)
+ 	}
+ 	cipherEntries := [numCiphers]*CipherEntry{}
+-	snapshot := cipherList.SnapshotForClientIP(nil)
++	snapshot, _ := cipherList.SnapshotForClientIP(nil)
+ 	for cipherNumber, element := range snapshot {
+ 		cipherEntries[cipherNumber] = element.Value.(*CipherEntry)
+ 	}
+@@ -205,7 +205,7 @@ func BenchmarkTCPFindCipherRepeat(b *testing.B) {
+ 		cipher := cipherEntries[cipherNumber].CryptoKey
+ 		go shadowsocks.NewWriter(writer, cipher).Write(makeTestPayload(50))
+ 		b.StartTimer()
+-		_, _, _, _, err := findAccessKey(&c, clientIP, cipherList)
++		_, _, _, _, _, err := findAccessKey(&c, clientIP, cipherList)
+ 		b.StopTimer()
+ 		if err != nil {
+ 			b.Error(err)
+@@ -343,7 +343,7 @@ func makeClientBytesCoalesced(t *testing.T, cryptoKey *shadowsocks.EncryptionKey
+ }
+ 
+ func firstCipher(cipherList CipherList) *shadowsocks.EncryptionKey {
+-	snapshot := cipherList.SnapshotForClientIP(nil)
++	snapshot, _ := cipherList.SnapshotForClientIP(nil)
+ 	cipherEntry := snapshot[0].Value.(*CipherEntry)
+ 	return cipherEntry.CryptoKey
+ }
+@@ -499,7 +499,7 @@ func TestReplayDefense(t *testing.T) {
+ 	testMetrics := &probeTestMetrics{}
+ 	const testTimeout = 200 * time.Millisecond
+ 	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, &replayCache, testMetrics, testTimeout)
+-	snapshot := cipherList.SnapshotForClientIP(nil)
++	snapshot, _ := cipherList.SnapshotForClientIP(nil)
+ 	cipherEntry := snapshot[0].Value.(*CipherEntry)
+ 	cipher := cipherEntry.CryptoKey
+ 	reader, writer := io.Pipe()
+@@ -577,7 +577,7 @@ func TestReverseReplayDefense(t *testing.T) {
+ 	testMetrics := &probeTestMetrics{}
+ 	const testTimeout = 200 * time.Millisecond
+ 	handler := NewTCPHandler(listener.Addr().(*net.TCPAddr).Port, cipherList, &replayCache, testMetrics, testTimeout)
+-	snapshot := cipherList.SnapshotForClientIP(nil)
++	snapshot, _ := cipherList.SnapshotForClientIP(nil)
+ 	cipherEntry := snapshot[0].Value.(*CipherEntry)
+ 	cipher := cipherEntry.CryptoKey
+ 	reader, writer := io.Pipe()
+diff --git a/service/udp.go b/service/udp.go
+index c2bd9a1..b71fce5 100644
+--- a/service/udp.go
++++ b/service/udp.go
+@@ -64,10 +64,13 @@ func debugUDPAddr(addr net.Addr, template string, val interface{}) {
+ 
+ // Decrypts src into dst. It tries each cipher until it finds one that authenticates
+ // correctly. dst and src must not overlap.
+-func findAccessKeyUDP(clientIP net.IP, dst, src []byte, cipherList CipherList) ([]byte, string, *shadowsocks.EncryptionKey, TrafficLimiter, error) {
++func findAccessKeyUDP(clientIP net.IP, dst, src []byte, cipherList CipherList) ([]byte, string, *shadowsocks.EncryptionKey,
++	TrafficLimiter, func(net.PacketConn) net.PacketConn,
++	error,
++) {
+ 	// Try each cipher until we find one that authenticates successfully. This assumes that all ciphers are AEAD.
+ 	// We snapshot the list because it may be modified while we use it.
+-	snapshot := cipherList.SnapshotForClientIP(clientIP)
++	snapshot, bittorentFilter := cipherList.SnapshotForClientIP(clientIP)
+ 	for ci, entry := range snapshot {
+ 		id, cryptoKey := entry.Value.(*CipherEntry).ID, entry.Value.(*CipherEntry).CryptoKey
+ 		limiter := entry.Value.(*CipherEntry).TrafficLimiter
+@@ -79,9 +82,12 @@ func findAccessKeyUDP(clientIP net.IP, dst, src []byte, cipherList CipherList) (
+ 		debugUDP(id, "Found cipher at index %d", ci)
+ 		// Move the active cipher to the front, so that the search is quicker next time.
+ 		cipherList.MarkUsedByClientIP(entry, clientIP)
+-		return buf, id, cryptoKey, limiter, nil
++
++		bitFilterConnFunc := GetUDPBitFilterConnFunc(bittorentFilter, entry.Value.(*CipherEntry))
++
++		return buf, id, cryptoKey, limiter, bitFilterConnFunc, nil
+ 	}
+-	return nil, "", nil, nil, errors.New("could not find valid cipher")
++	return nil, "", nil, nil, nil, errors.New("could not find valid cipher")
+ }
+ 
+ type packetHandler struct {
+@@ -166,8 +172,9 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
+ 				ip := clientAddr.(*net.UDPAddr).IP
+ 				var textData []byte
+ 				var cryptoKey *shadowsocks.EncryptionKey
++				var bitFilterConnFunc func(net.PacketConn) net.PacketConn
+ 				unpackStart := time.Now()
+-				textData, keyID, cryptoKey, limiter, err = findAccessKeyUDP(ip, textBuf, cipherData, h.ciphers)
++				textData, keyID, cryptoKey, limiter, bitFilterConnFunc, err = findAccessKeyUDP(ip, textBuf, cipherData, h.ciphers)
+ 				timeToCipher := time.Since(unpackStart)
+ 				h.m.AddUDPCipherSearch(err == nil, timeToCipher)
+ 
+@@ -184,7 +191,8 @@ func (h *packetHandler) Handle(clientConn net.PacketConn) {
+ 				if err != nil {
+ 					return onet.NewConnectionError("ERR_CREATE_SOCKET", "Failed to create UDP socket", err)
+ 				}
+-				targetConn = nm.Add(clientAddr, clientConn, cryptoKey, udpConn, clientInfo, keyID, limiter)
++				// TODO: WRAP udpConn with a bittorent filter h.ciphers....
++				targetConn = nm.Add(clientAddr, clientConn, cryptoKey, bitFilterConnFunc(udpConn), clientInfo, keyID, limiter)
+ 			} else {
+ 				clientInfo = targetConn.clientInfo
+ 
+diff --git a/service/udp_test.go b/service/udp_test.go
+index 236554a..3f52202 100644
+--- a/service/udp_test.go
++++ b/service/udp_test.go
+@@ -129,7 +129,8 @@ func (m *natTestMetrics) AddUDPCipherSearch(accessKeyFound bool, timeToCipher ti
+ // generates when localhost access is attempted
+ func sendToDiscard(payloads [][]byte, validator onet.TargetIPValidator) *natTestMetrics {
+ 	ciphers, _ := MakeTestCiphers([]string{"asdf"}, 0, 0)
+-	cipher := ciphers.SnapshotForClientIP(nil)[0].Value.(*CipherEntry).CryptoKey
++	cipherList, _ := ciphers.SnapshotForClientIP(nil)
++	cipher := cipherList[0].Value.(*CipherEntry).CryptoKey
+ 	clientConn := makePacketConn()
+ 	metrics := &natTestMetrics{}
+ 	handler := NewPacketHandler(timeout, ciphers, metrics)
+@@ -223,7 +224,8 @@ func setupNAT() (*fakePacketConn, *fakePacketConn, *natconn) {
+ 	nat := newNATmap(timeout, &natTestMetrics{}, &sync.WaitGroup{})
+ 	clientConn := makePacketConn()
+ 	targetConn := makePacketConn()
+-	entrySnap := cipherList.SnapshotForClientIP(net.IP{})[0].Value
++	ciphers, _ := cipherList.SnapshotForClientIP(net.IP{})
++	entrySnap := ciphers[0].Value
+ 	key, limiter := entrySnap.(*CipherEntry).ID, entrySnap.(*CipherEntry).TrafficLimiter
+ 	nat.Add(&clientAddr, clientConn, natCryptoKey, targetConn, ipinfo.IPInfo{CountryCode: "ZZ"}, key, limiter)
+ 	entry := nat.Get(clientAddr.String())
+@@ -432,7 +434,7 @@ func BenchmarkUDPUnpackRepeat(b *testing.B) {
+ 	testBuf := make([]byte, serverUDPBufferSize)
+ 	packets := [numCiphers][]byte{}
+ 	ips := [numCiphers]net.IP{}
+-	snapshot := cipherList.SnapshotForClientIP(nil)
++	snapshot, _ := cipherList.SnapshotForClientIP(nil)
+ 	for i, element := range snapshot {
+ 		packets[i] = make([]byte, 0, serverUDPBufferSize)
+ 		plaintext := makeTestPayload(50)
+@@ -447,7 +449,7 @@ func BenchmarkUDPUnpackRepeat(b *testing.B) {
+ 		cipherNumber := n % numCiphers
+ 		ip := ips[cipherNumber]
+ 		packet := packets[cipherNumber]
+-		_, _, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
++		_, _, _, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
+ 		if err != nil {
+ 			b.Error(err)
+ 		}
+@@ -463,7 +465,7 @@ func BenchmarkUDPUnpackSharedKey(b *testing.B) {
+ 	}
+ 	testBuf := make([]byte, serverUDPBufferSize)
+ 	plaintext := makeTestPayload(50)
+-	snapshot := cipherList.SnapshotForClientIP(nil)
++	snapshot, _ := cipherList.SnapshotForClientIP(nil)
+ 	cryptoKey := snapshot[0].Value.(*CipherEntry).CryptoKey
+ 	packet, err := shadowsocks.Pack(make([]byte, serverUDPBufferSize), plaintext, cryptoKey)
+ 	require.Nil(b, err)
+@@ -476,7 +478,7 @@ func BenchmarkUDPUnpackSharedKey(b *testing.B) {
+ 	b.ResetTimer()
+ 	for n := 0; n < b.N; n++ {
+ 		ip := ips[n%numIPs]
+-		_, _, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
++		_, _, _, _, _, err := findAccessKeyUDP(ip, testBuf, packet, cipherList)
+ 		if err != nil {
+ 			b.Error(err)
+ 		}
