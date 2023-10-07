@@ -1,5 +1,5 @@
 name: "vg-outline-ss-server"
-arch: "all"
+arch: "amd64"
 platform: "linux"
 version: ${PACKAGE_VERSION}
 section: "default"
